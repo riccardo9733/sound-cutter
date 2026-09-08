@@ -120,6 +120,8 @@ The interface opens at `http://127.0.0.1:8765` with four interactive panels:
 | `--load-model` | — | Run detection using a previously saved `.npz` detector (fast, runs without TensorFlow). |
 | `--safe` | off | Lighter encoding preset (`veryfast` with thread caps) to keep CPUs cool on long encodes. |
 | `--no-cut` | off | Scan and train only without exporting video files (fast iteration). |
+| `--export` | `both` | What cuts to export: `both` (events only + clean cut), `events` (only events), or `clean` (only clean video without events). |
+| `--events-file` | None | Cut video directly using approved intervals from a JSON or text file, skipping audio detection. |
 | `--limit-minutes` | None | Process only the first N minutes of video for quick testing. |
 | `--label` | off | Open the standalone browser labeling tool. |
 | `--ui` | off | Open the full local web application. |

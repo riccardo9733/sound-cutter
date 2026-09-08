@@ -27,11 +27,18 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except ImportError:
+    pass
 
 from wave_ui import WAVE_JS, serve_wave
 
@@ -111,6 +118,30 @@ def build_command(params: dict) -> tuple[list[str], Path]:
 
     no_train = bool(params.get("no_train"))
     no_cut = bool(params.get("no_cut"))
+
+    approved = params.get("approved_events")
+    if approved is not None and not no_cut:
+        if not isinstance(approved, list) or len(approved) == 0:
+            raise ValueError("Tutti gli eventi sono stati eliminati o esclusi dalla soglia. Nessun evento da esportare.")
+        tfile = tempfile.NamedTemporaryFile(
+            mode="w", prefix="autocut_approved_", suffix=".json", delete=False, encoding="utf-8"
+        )
+        json.dump(approved, tfile)
+        tfile.close()
+        cmd = [str(AUTOCUT_SCRIPT), str(video), "--events-file", tfile.name]
+        export_mode = params.get("export_mode", "both")
+        if export_mode and export_mode in ("both", "events", "clean"):
+            cmd += ["--export", export_mode]
+        if params.get("safe"):
+            cmd += ["--safe"]
+        outdir = str(params.get("outdir", "")).strip()
+        if outdir:
+            p = Path(outdir)
+            if not p.is_absolute():
+                p = ROOT / p
+            cmd += ["--outdir", str(p)]
+        return cmd, None
+
     if no_cut:
         cmd += ["--no-cut"]
 
@@ -244,6 +275,7 @@ def build_command(params: dict) -> tuple[list[str], Path]:
 
     for flag, key in [("--min-gap", "min_gap"),
                       ("--tail-hangover", "tail_hangover"),
+                      ("--max-tail-extension", "max_tail_extension"),
                       ("--min-duration", "min_duration"),
                       ("--max-duration", "max_duration"),
                       ("--min-confidence", "min_confidence"),
@@ -267,6 +299,10 @@ def build_command(params: dict) -> tuple[list[str], Path]:
     sound_type = params.get("sound_type", "laughter")
     if sound_type:
         cmd += ["--sound-type", sound_type]
+
+    export_mode = params.get("export_mode", "both")
+    if export_mode and export_mode in ("both", "events", "clean"):
+        cmd += ["--export", export_mode]
 
     if params.get("safe"):
         cmd += ["--safe"]
@@ -446,6 +482,44 @@ PAGE = r"""<!doctype html>
   ul.events li:hover { border-color:var(--accent); }
   ul.events li.excluded { opacity:0.32; filter:grayscale(0.85); background:#090a0d; }
   ul.events li.excluded:hover { opacity:0.6; }
+  ul.events li.deleted {
+    opacity: 0.42;
+    background: #180d0f;
+    border-color: rgba(239, 68, 68, 0.4);
+  }
+  ul.events li.deleted .ev-info {
+    text-decoration: line-through;
+    color: #94a3b8;
+  }
+  ul.events li.deleted .ev-info b, ul.events li.deleted .ev-info span {
+    color: #64748b !important;
+    text-decoration: line-through;
+  }
+  .btn-delete-event {
+    background: rgba(239, 68, 68, 0.14);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-delete-event:hover {
+    background: #dc2626;
+    color: #fff;
+    border-color: #ef4444;
+  }
+  .btn-delete-event.restore {
+    background: rgba(56, 189, 248, 0.15);
+    color: #38bdf8;
+    border-color: rgba(56, 189, 248, 0.4);
+  }
+  .btn-delete-event.restore:hover {
+    background: #0284c7;
+    color: #fff;
+  }
   #log { background:#0a0b0d; border:1px solid var(--border); border-radius:8px;
          padding:10px; font-family:ui-monospace, Menlo, monospace; font-size:12px;
          white-space:pre-wrap; word-break:break-word; height:230px; overflow:auto;
@@ -649,10 +723,14 @@ PAGE = r"""<!doctype html>
         <span>70% (Solo medi & certi)</span>
         <span>85% (Solo certissimi)</span>
       </div>
+      <div id="col2Actions" style="display:none; justify-content:space-between; align-items:center; margin-top:8px; padding-top:6px; border-top:1px solid rgba(255,255,255,0.08)">
+        <button id="bRestoreAll" style="display:none; font-size:11px; padding:4px 9px; background:#1e293b; color:#38bdf8; border:1px solid #334155; border-radius:4px; cursor:pointer" title="Ripristina tutti gli eventi precedentemente eliminati">↩️ Ripristina eliminati</button>
+        <button id="bRunCol2" class="btn-run" style="font-size:12px; padding:5px 14px; font-weight:700; margin-left:auto" title="Esporta direttamente il video contenente solo gli eventi approvati sopra">✂️ Esporta Video</button>
+      </div>
     </div>
 
     <div style="margin:8px 0 6px; font-size:12px; color:#94a3b8; line-height:1.4">
-      Clicca un evento per ascoltare e zoomare. Usa <b>✏️ Come [+]</b> per stringere i bordi sul suono, o <b>🚫 Come [-]</b> per eliminare il falso positivo.
+      Clicca un evento per ascoltare e zoomare. Usa <b>🗑️ Elimina</b> per toglierlo dal video finale <code>_events_only.mp4</code>, <b>✏️ [+]</b> per rifinirlo, o <b>🚫 [-]</b> per falsi positivi.
     </div>
     <ul class="events" id="events"></ul>
     <div id="outputs" style="margin-top:10px"></div>
@@ -716,7 +794,7 @@ PAGE = r"""<!doctype html>
       </div>
       <div>
         <label>Coda / Hangover (s)</label>
-        <input type="number" id="tailHangover" value="0.25" min="0" step="0.05" title="Buffer acustico naturale per non troncare la conclusione/decadimento del suono">
+        <input type="number" id="tailHangover" value="0.35" min="0" step="0.05" title="Buffer acustico naturale per non troncare la conclusione/decadimento del suono">
       </div>
       <div>
         <label>Unisci se vicini &lt; (s)</label>
@@ -742,6 +820,14 @@ PAGE = r"""<!doctype html>
         <label>Cartella output</label>
         <input type="text" id="outdir" placeholder="vuoto = accanto al video">
       </div>
+      <div>
+        <label>Cosa esportare</label>
+        <select id="exportMode">
+          <option value="both" selected>🎬 Entrambi (Eventi + Senza eventi)</option>
+          <option value="events">🎯 Solo gli eventi (_events_only.mp4)</option>
+          <option value="clean">✨ Solo senza eventi (_clean.mp4)</option>
+        </select>
+      </div>
     </div>
 
     <label style="margin-top:8px">
@@ -761,7 +847,7 @@ PAGE = r"""<!doctype html>
     <div class="row" style="margin-top:10px; gap:6px; flex-wrap:wrap">
       <button class="btn-detect" id="bDetectOnly" title="Scansiona il video istantaneamente usando il modello attuale o YAMNet, senza riallenare e senza esportare tagli video (veloce, 2s)">🔍 Scansiona (Senza Allenare)</button>
       <button class="btn-scan" id="bScanOnly" title="Addestra il modello e scansiona la traccia audio in 2-3 secondi, senza attendere il rendering video">🧠 Allena Modello & Scansiona (2-3s)</button>
-      <button class="btn-run" id="bRun" title="Esegue il rilevamento e ritaglia i file video completi con ffmpeg">✂️ Esporta Video Tagliato</button>
+      <button class="btn-run" id="bRun" title="Esegue il rilevamento e ritaglia i file video scelti (eventi, senza eventi o entrambi)">✂️ Esporta Video Tagliato</button>
       <button class="btn-stop" id="bStop" disabled>⏹ Stop</button>
     </div>
     <div id="status">Nessuna elaborazione in corso.</div>
@@ -852,6 +938,13 @@ function selectVideo(path) {
     labels = d.labels || [];
     $('teachLabels').value = labelsText();
     refreshLabels();
+    currentEvents = [];
+    $('events').innerHTML = '';
+    $('summary').textContent = 'Esegui un rilevamento per vedere qui gli eventi trovati in tempo reale.';
+    if ($('col2Actions')) $('col2Actions').style.display = 'none';
+    if ($('lblCountBadge')) $('lblCountBadge').textContent = '';
+    if (window.wave && window.wave.setResults) window.wave.setResults([]);
+    if ($('bRun')) $('bRun').textContent = '✂️ Esporta Video Tagliato';
     window.waveUrl = '/api/wave?path=' + encodeURIComponent(path);
     if (window.loadWave) window.loadWave();
     $('status').textContent = 'Video caricato: ' + d.name +
@@ -1067,6 +1160,18 @@ document.addEventListener('keydown', e => {
     case 'ArrowLeft': e.preventDefault(); v.currentTime = Math.max(0, v.currentTime - step); break;
     case 'ArrowRight': e.preventDefault();
       v.currentTime = Math.min(v.duration || 1e9, v.currentTime + step); break;
+    case 'Delete':
+    case 'Backspace':
+    case 'x': case 'X': {
+      if (window.wave && window.wave.getCurrentEventIndex && currentEvents && currentEvents.length) {
+        const cIdx = window.wave.getCurrentEventIndex();
+        if (cIdx >= 0 && cIdx < currentEvents.length) {
+          e.preventDefault();
+          toggleDeleteEvent(currentEvents[cIdx].idx);
+        }
+      }
+      break;
+    }
   }
 });
 v.addEventListener('timeupdate', () => {
@@ -1110,8 +1215,10 @@ $('threshold').oninput = e => {
 };
 
 /* ---------- esecuzione ---------- */
+let currentEvents = []; // [{start, end, idx, dur, conf, deleted, excluded}]
+
 function collectParams() {
-  return {
+  const p = {
     video: currentVideo(),
     mode: mode,
     teach_labels: labels,
@@ -1123,15 +1230,21 @@ function collectParams() {
     min_confidence: ($('minConfSlider') && parseFloat($('minConfSlider').value) > 0) ? (parseFloat($('minConfSlider').value) / 100.0) : 0.0,
     sound_type: $('soundType').value,
     pad: parseFloat($('pad').value),
-    tail_hangover: $('tailHangover') ? parseFloat($('tailHangover').value) : 0.25,
+    tail_hangover: $('tailHangover') ? parseFloat($('tailHangover').value) : 0.35,
     min_gap: parseFloat($('minGap').value),
     min_duration: parseFloat($('minDur').value),
     max_duration: $('maxDur').value ? parseFloat($('maxDur').value) : null,
     silence_threshold: $('silenceThresh').value ? parseFloat($('silenceThresh').value) : null,
     limit_minutes: $('limitMin').value ? parseFloat($('limitMin').value) : 0,
+    export_mode: $('exportMode') ? $('exportMode').value : 'both',
     safe: $('safe').checked,
     outdir: $('outdir').value.trim(),
   };
+  if (currentEvents && currentEvents.length > 0) {
+    const active = currentEvents.filter(ev => !ev.deleted && !ev.excluded);
+    p.approved_events = active.map(ev => [ev.start, ev.end]);
+  }
+  return p;
 }
 let renderedDuringRun = false;
 
@@ -1140,8 +1253,16 @@ function startRun(noCut, noTrain) {
   params.no_cut = !!noCut;
   params.no_train = !!noTrain;
   if (!params.video) { alert('Prima scegli il video sorgente.'); return; }
+  if (!noCut && params.approved_events !== undefined && params.approved_events.length === 0) {
+    alert('Tutti gli eventi sono stati eliminati o esclusi dalla soglia. Nessun evento da esportare nel video _only.');
+    return;
+  }
   $('log').textContent = '';
-  $('events').innerHTML = '';
+  if (noCut) {
+    $('events').innerHTML = '';
+    currentEvents = [];
+    if ($('col2Actions')) $('col2Actions').style.display = 'none';
+  }
   $('outputs').innerHTML = '';
   $('outV').style.display = 'none';
   renderedDuringRun = false;
@@ -1150,13 +1271,22 @@ function startRun(noCut, noTrain) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(params)
   }).then(r => r.json()).then(d => {
-    if (d.error) { $('log').textContent = '❌ ' + d.error; $('status').textContent = 'Errore.'; return; }
+    if (d.error) { $('log').textContent = '❌ ' + d.error; $('status').textContent = 'Errore: ' + d.error; return; }
     $('cmd').textContent = d.command;
     let stMsg = 'Elaborazione e taglio video in corso…';
     if (noTrain) stMsg = 'Scansione rapida in corso (senza allenare)…';
     else if (noCut) stMsg = 'Addestramento e scansione rapida in corso…';
+    else {
+      const exp = params.export_mode || 'both';
+      const evCount = params.approved_events ? params.approved_events.length : null;
+      const countMsg = evCount !== null ? ` (${evCount} eventi approvati)` : '';
+      if (exp === 'events') stMsg = `Esportazione solo eventi in corso${countMsg}…`;
+      else if (exp === 'clean') stMsg = `Esportazione solo video pulito in corso${countMsg}…`;
+      else stMsg = `Esportazione tagli in corso${countMsg}…`;
+    }
     $('status').innerHTML = '<span class="spin">⏳</span> ' + stMsg;
     $('bRun').disabled = true;
+    if ($('bRunCol2')) $('bRunCol2').disabled = true;
     if ($('bScanOnly')) $('bScanOnly').disabled = true;
     if ($('bDetectOnly')) $('bDetectOnly').disabled = true;
     $('bStop').disabled = false;
@@ -1164,6 +1294,7 @@ function startRun(noCut, noTrain) {
   }).catch(err => alert('Errore: ' + err));
 }
 $('bRun').onclick = () => startRun(false, false);
+if ($('bRunCol2')) $('bRunCol2').onclick = () => startRun(false, false);
 if ($('bScanOnly')) $('bScanOnly').onclick = () => startRun(true, false);
 if ($('bDetectOnly')) $('bDetectOnly').onclick = () => startRun(true, true);
 
@@ -1183,6 +1314,7 @@ function poll() {
     if (d.running) return;
     clearInterval(pollTimer); pollTimer = null;
     $('bRun').disabled = false;
+    if ($('bRunCol2')) $('bRunCol2').disabled = false;
     if ($('bScanOnly')) $('bScanOnly').disabled = false;
     if ($('bDetectOnly')) $('bDetectOnly').disabled = false;
     $('bStop').disabled = true;
@@ -1200,33 +1332,120 @@ function appendLog(line) {
   log.scrollTop = log.scrollHeight;
 }
 
+function updateResultsSummaryAndWave() {
+  const activeEvents = currentEvents.filter(ev => !ev.deleted && !ev.excluded);
+  const deletedEvents = currentEvents.filter(ev => ev.deleted);
+  const totalCount = currentEvents.length;
+  const activeCount = activeEvents.length;
+  const activeDur = activeEvents.reduce((acc, ev) => acc + (ev.dur || (ev.end - ev.start)), 0);
+
+  if (totalCount > 0) {
+    let statText = `${activeCount}/${totalCount} inclusi (${activeDur.toFixed(1)}s)`;
+    if (deletedEvents.length > 0) {
+      statText += ` · ${deletedEvents.length} eliminat${deletedEvents.length === 1 ? 'o' : 'i'}`;
+    }
+    $('filteredStats').textContent = statText;
+    if ($('lblCountBadge')) {
+      $('lblCountBadge').textContent = statText;
+    }
+    if ($('col2Actions')) {
+      $('col2Actions').style.display = 'flex';
+    }
+    if ($('bRunCol2')) {
+      $('bRunCol2').textContent = `✂️ Esporta Video (${activeCount} event${activeCount === 1 ? 'o' : 'i'})`;
+      $('bRunCol2').disabled = (activeCount === 0);
+    }
+    if ($('bRun')) {
+      $('bRun').textContent = `✂️ Esporta Video Tagliato (${activeCount} event${activeCount === 1 ? 'o' : 'i'})`;
+    }
+    const restoreBtn = $('bRestoreAll');
+    if (restoreBtn) {
+      restoreBtn.style.display = deletedEvents.length > 0 ? 'inline-block' : 'none';
+      restoreBtn.textContent = `↩️ Ripristina ${deletedEvents.length} eliminat${deletedEvents.length === 1 ? 'o' : 'i'}`;
+    }
+  }
+
+  if (window.wave && window.wave.setResults) {
+    window.wave.setResults(activeEvents);
+  }
+}
+
+function toggleDeleteEvent(idx) {
+  const ev = currentEvents.find(e => e.idx === idx);
+  if (!ev) return;
+  ev.deleted = !ev.deleted;
+  const li = $('events').querySelector(`li[data-idx="${idx}"]`);
+  if (li) {
+    const bDel = li.querySelector('.btn-delete-event');
+    const bPos = li.querySelector('.btn-convert-pos');
+    const bNeg = li.querySelector('.btn-convert-neg');
+    if (ev.deleted) {
+      li.classList.add('deleted');
+      if (bDel) {
+        bDel.textContent = '↩️ Ripristina';
+        bDel.classList.add('restore');
+        bDel.title = 'Ripristina questo evento nei tagli';
+      }
+      if (bPos) bPos.style.display = 'none';
+      if (bNeg) bNeg.style.display = 'none';
+    } else {
+      li.classList.remove('deleted');
+      if (bDel) {
+        bDel.textContent = '🗑️ Elimina';
+        bDel.classList.remove('restore');
+        bDel.title = 'Elimina questo evento (non apparirà nel video finale _events_only.mp4)';
+      }
+      if (bPos) bPos.style.display = '';
+      if (bNeg) bNeg.style.display = '';
+    }
+  }
+  updateResultsSummaryAndWave();
+}
+
+function restoreAllEvents() {
+  currentEvents.forEach(ev => {
+    if (ev.deleted) {
+      ev.deleted = false;
+      const li = $('events').querySelector(`li[data-idx="${ev.idx}"]`);
+      if (li) {
+        li.classList.remove('deleted');
+        const bDel = li.querySelector('.btn-delete-event');
+        if (bDel) {
+          bDel.textContent = '🗑️ Elimina';
+          bDel.classList.remove('restore');
+          bDel.title = 'Elimina questo evento (non apparirà nel video finale _events_only.mp4)';
+        }
+        const bPos = li.querySelector('.btn-convert-pos');
+        const bNeg = li.querySelector('.btn-convert-neg');
+        if (bPos) bPos.style.display = '';
+        if (bNeg) bNeg.style.display = '';
+      }
+    }
+  });
+  updateResultsSummaryAndWave();
+}
+if ($('bRestoreAll')) $('bRestoreAll').onclick = restoreAllEvents;
+
 function applyMinConfFilter() {
   const slider = $('minConfSlider');
   if (!slider) return;
   const minVal = parseInt(slider.value, 10);
   $('minConfLabel').textContent = minVal === 0 ? 'Tutti (0%)' : '≥ ' + minVal + '%';
-  let activeCount = 0;
-  let activeDur = 0;
-  let totalCount = 0;
 
-  document.querySelectorAll('#events li').forEach(li => {
-    totalCount++;
-    const c = parseInt(li.dataset.conf || '100', 10);
-    const d = parseFloat(li.dataset.dur || '0');
-    if (c >= minVal) {
-      li.classList.remove('excluded');
-      activeCount++;
-      activeDur += d;
-    } else {
-      li.classList.add('excluded');
+  currentEvents.forEach(ev => {
+    const c = ev.conf !== null ? ev.conf : 100;
+    ev.excluded = (c < minVal);
+    const li = $('events').querySelector(`li[data-idx="${ev.idx}"]`);
+    if (li) {
+      if (ev.excluded) {
+        li.classList.add('excluded');
+      } else {
+        li.classList.remove('excluded');
+      }
     }
   });
 
-  if (totalCount > 0) {
-    $('filteredStats').textContent = minVal === 0
-      ? `${totalCount} eventi (${activeDur.toFixed(1)}s)`
-      : `${activeCount}/${totalCount} inclusi (${activeDur.toFixed(1)}s)`;
-  }
+  updateResultsSummaryAndWave();
 }
 if ($('minConfSlider')) $('minConfSlider').oninput = applyMinConfFilter;
 
@@ -1237,21 +1456,22 @@ function renderResults() {
   $('events').innerHTML = '';
   let n = null;
   let autoThVal = null;
-  const parsedEvents = [];
+  currentEvents = [];
 
   text.split('\n').forEach(line => {
     let m_th = line.match(/\[Auto-Threshold\] (?:Optimal threshold determined|Applying calculated threshold): ([\d.]+)/);
     if (m_th) autoThVal = m_th[1];
 
-    let m = line.match(/Detected (\d+) (?:event|burp)\(s\):/);
+    let m = line.match(/(?:Detected|Loaded)\s+(\d+)\s+(?:approved\s+)?(?:event|burp)\(s\):/i);
     if (m) n = parseInt(m[1], 10);
     m = line.match(/^\s*(\d+)\.\s+([\d.]+)\s*s\s*→\s*([\d.]+)\s*s\s*\(\s*([\d.]+)\s*s(?:[,\s]*conf:\s*(\d+)%)?\s*\)/);
     if (m) {
-      const idx = m[1];
+      const idx = parseInt(m[1], 10);
       const st = parseFloat(m[2]), en = parseFloat(m[3]);
       const dur = parseFloat(m[4]);
       const conf = m[5] ? parseInt(m[5], 10) : null;
-      parsedEvents.push({start: st, end: en, idx: parseInt(idx, 10), conf: conf});
+      const evItem = { start: st, end: en, idx: idx, dur: dur, conf: conf, deleted: false, excluded: false };
+      currentEvents.push(evItem);
 
       let badgeHtml = '';
       if (conf !== null) {
@@ -1265,23 +1485,26 @@ function renderResults() {
       }
 
       const li = document.createElement('li');
+      li.id = 'ev_li_' + idx;
+      li.dataset.idx = idx;
+      li.dataset.conf = conf !== null ? conf : 100;
+      li.dataset.dur = dur;
       li.style.display = 'flex';
       li.style.alignItems = 'center';
       li.style.justifyContent = 'space-between';
       li.style.transition = 'all 0.15s';
-      li.dataset.conf = conf !== null ? conf : 100;
-      li.dataset.dur = dur;
 
-      li.innerHTML = '<div style="display:flex;align-items:center;gap:6px;cursor:pointer;flex:1">' +
+      li.innerHTML = '<div class="ev-info" style="display:flex;align-items:center;gap:6px;cursor:pointer;flex:1">' +
         '<b style="color:var(--amber)">#' + idx + '</b> ' + fmt(st) + ' → ' + fmt(en) +
         ' <span style="color:#888">(' + dur.toFixed(2) + 's)</span> ' + badgeHtml +
         '</div>' +
-        '<div style="display:flex;align-items:center;gap:6px">' +
-        '<button class="btn-convert-pos" title="Aggiungi come positivo [+] e rifinisci i bordi sulla forma d\'onda">✏️ Come [+]</button>' +
-        '<button class="btn-convert-neg" title="Aggiungi come falso positivo [-] per escluderlo dal modello">🚫 Come [-]</button>' +
+        '<div class="ev-actions" style="display:flex;align-items:center;gap:5px">' +
+        '<button class="btn-convert-pos" title="Aggiungi come positivo [+] e rifinisci i bordi sulla forma d\'onda">✏️ [+]</button>' +
+        '<button class="btn-convert-neg" title="Aggiungi come falso positivo [-] per escluderlo dal modello e dal video">🚫 [-]</button>' +
+        '<button class="btn-delete-event" title="Elimina questo evento dai risultati e dal video finale _events_only.mp4">🗑️ Elimina</button>' +
         '</div>';
 
-      li.querySelector('div').onclick = () => {
+      li.querySelector('.ev-info').onclick = () => {
         if (window.wave && window.wave.focusInterval) {
           window.wave.focusInterval(st, en);
         } else if (window.redrawWave) {
@@ -1297,32 +1520,35 @@ function renderResults() {
 
       const bPos = li.querySelector('.btn-convert-pos');
       const bNeg = li.querySelector('.btn-convert-neg');
+      const bDel = li.querySelector('.btn-delete-event');
 
       bPos.onclick = e => {
         e.stopPropagation();
         convertToLabel(st, en, 'pos', li);
+        if (evItem.deleted) toggleDeleteEvent(idx);
       };
       bNeg.onclick = e => {
         e.stopPropagation();
         convertToLabel(st, en, 'neg', li);
+        if (!evItem.deleted) toggleDeleteEvent(idx);
+      };
+      bDel.onclick = e => {
+        e.stopPropagation();
+        toggleDeleteEvent(idx);
       };
 
       $('events').appendChild(li);
     }
   });
 
-  if (window.wave && window.wave.setResults) {
-    window.wave.setResults(parsedEvents);
-  }
-
   applyMinConfFilter();
 
   if (n !== null) {
     const p = document.createElement('div');
     const thText = autoThVal ? ' <span style="color:var(--amber);font-weight:normal">(🎯 soglia auto calcolata: <b>' + autoThVal + '</b>)</span>' : '';
-    p.innerHTML = '<b>' + n + ' eventi rilevati.</b>' + thText + ' Clicca per ascoltare e zoomare. Usa <b>✏️ Come [+]</b> per stringere i bordi sul suono, o <b>🚫 Come [-]</b> per eliminare i falsi positivi.';
+    p.innerHTML = '<b>' + n + ' eventi rilevati.</b>' + thText + ' Clicca un evento per ascoltare. Usa <b>🗑️ Elimina</b> per toglierlo dal video finale <code>_events_only.mp4</code>.';
     summary.appendChild(p);
-  } else {
+  } else if (!currentEvents.length) {
     summary.textContent = 'Nessun evento rilevato. Prova ad abbassare la soglia o a usare la modalità con etichette.';
   }
 
@@ -1338,7 +1564,7 @@ function renderResults() {
   outs.forEach(([kind, path]) => {
     const span = document.createElement('span');
     span.className = 'badge';
-    span.textContent = (kind === 'events_only' || kind === 'burps_only' ? '🎯 Solo eventi' : '🎬 Video pulito') + ' — ' + path.replace(/^.*\//, '');
+    span.textContent = (kind === 'events_only' || kind === 'burps_only' ? '🎯 Solo eventi' : '✨ Solo senza eventi (pulito)') + ' — ' + path.replace(/^.*\//, '');
     span.onclick = () => previewOut(kind, path);
     box.appendChild(span);
     box.appendChild(document.createTextNode(' '));
@@ -1356,7 +1582,7 @@ function convertToLabel(st, en, type, li) {
   const bPos = li.querySelector('.btn-convert-pos');
   const bNeg = li.querySelector('.btn-convert-neg');
   if (type === 'pos') {
-    if (bPos) { bPos.classList.add('active'); bPos.textContent = '✅ Convertito [+]'; }
+    if (bPos) { bPos.classList.add('active'); bPos.textContent = '✅ [+]'; }
     if (bNeg) { bNeg.classList.remove('active'); bNeg.style.opacity = '0.5'; }
     li.style.borderColor = 'rgba(34, 197, 94, 0.6)';
     li.style.background = 'rgba(34, 197, 94, 0.08)';
@@ -1370,7 +1596,7 @@ function convertToLabel(st, en, type, li) {
       v.play();
     }
   } else {
-    if (bNeg) { bNeg.classList.add('active'); bNeg.textContent = '🚫 Escluso [-]'; }
+    if (bNeg) { bNeg.classList.add('active'); bNeg.textContent = '🚫 [-]'; }
     if (bPos) { bPos.classList.remove('active'); bPos.style.opacity = '0.5'; }
     li.style.borderColor = 'rgba(239, 68, 68, 0.6)';
     li.style.background = 'rgba(239, 68, 68, 0.08)';

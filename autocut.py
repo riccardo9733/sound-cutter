@@ -23,6 +23,7 @@ back to the static binary bundled with moviepy/imageio-ffmpeg.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import shutil
@@ -31,6 +32,12 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except ImportError:
+    pass
 
 try:
     import numpy as np
@@ -230,7 +237,28 @@ def run_yamnet(audio: np.ndarray, chunk_seconds: float = 240.0) -> tuple[np.ndar
             f"(import error: {exc})"
         )
 
-    model = hub.load("https://tfhub.dev/google/yamnet/1")
+    try:
+        model = hub.load("https://tfhub.dev/google/yamnet/1")
+    except ValueError as exc:
+        msg = str(exc)
+        if "saved_model.pb" in msg or "incompatible/unknown type" in msg:
+            import re
+            m = re.search(r"'(.*?)'", msg)
+            bad_dir = m.group(1) if m else None
+            if bad_dir and os.path.isdir(bad_dir):
+                print(f"      [!] Cache YAMNet incompleta o corrotta rilevata in {bad_dir}. Rimozione e nuovo download in corso...", flush=True)
+                shutil.rmtree(bad_dir, ignore_errors=True)
+                desc = bad_dir + ".descriptor.txt"
+                if os.path.exists(desc):
+                    try:
+                        os.remove(desc)
+                    except OSError:
+                        pass
+                model = hub.load("https://tfhub.dev/google/yamnet/1")
+            else:
+                raise
+        else:
+            raise
 
     sr = YAMNET_SAMPLE_RATE
     hop_samples = int(YAMNET_HOP_SECONDS * sr)   # 7680 samples (0.48 s)
@@ -841,19 +869,83 @@ def frames_to_seconds(frame_index: int, hop_seconds: float) -> float:
     return (frame_index + 0.5) * hop_seconds
 
 
+def calculate_track_noise_floor(audio: np.ndarray, sr: int = YAMNET_SAMPLE_RATE) -> float:
+    """Calculate steady-state ambient room/background noise floor (RMS) across the track."""
+    if audio is None or len(audio) == 0:
+        return 1e-4
+    win_len = int(0.025 * sr)
+    hop_len = int(0.050 * sr)
+    if len(audio) < win_len:
+        return 1e-4
+    step = max(1, len(audio) // (100000 * hop_len)) * hop_len
+    rms = [float(np.sqrt(np.mean(audio[i:i + win_len] ** 2)))
+           for i in range(0, len(audio) - win_len, step)]
+    return float(np.percentile(rms, 15)) if rms else 1e-4
+
+
+def refine_event_onset(
+    audio: np.ndarray,
+    sr: int,
+    start_t: float,
+    end_t: float,
+    max_pre_roll: float = 1.5,
+    noise_floor: float = 1e-4,
+) -> float:
+    """Trace backwards from start_t to capture the emergence of the sound event from ambient noise."""
+    if audio is None or len(audio) == 0 or max_pre_roll <= 0.0:
+        return start_t
+
+    win_len = int(0.025 * sr)
+    hop_len = int(0.010 * sr)
+
+    ev_start = max(0, int(start_t * sr))
+    ev_end = min(len(audio), int(end_t * sr))
+    if ev_end - ev_start >= win_len:
+        ev_chunk = audio[ev_start:ev_end]
+        ev_rms = [float(np.sqrt(np.mean(ev_chunk[i:i + win_len] ** 2)))
+                  for i in range(0, len(ev_chunk) - win_len, hop_len)]
+        peak_rms = float(np.max(ev_rms)) if ev_rms else noise_floor
+    else:
+        peak_rms = noise_floor
+
+    dynamic_range = max(0.0, peak_rms - noise_floor)
+    onset_threshold = max(noise_floor * 1.35, noise_floor + 0.015 * dynamic_range, 0.005)
+
+    search_start = max(0, int((start_t - max_pre_roll) * sr))
+    search_end = min(len(audio), int((start_t + 0.20) * sr))
+    if search_end - search_start < win_len:
+        return start_t
+
+    chk = audio[search_start:search_end]
+    o_times = [(search_start + i + win_len / 2.0) / sr for i in range(0, len(chk) - win_len, hop_len)]
+    o_rms = [float(np.sqrt(np.mean(chk[i:i + win_len] ** 2))) for i in range(0, len(chk) - win_len, hop_len)]
+
+    first_active_t = start_t
+    for t, r in reversed(list(zip(o_times, o_rms))):
+        if t <= start_t:
+            if r > onset_threshold:
+                first_active_t = t
+            else:
+                break
+    return min(start_t, first_active_t)
+
+
 def refine_event_tail(
     audio: np.ndarray,
     sr: int,
     start_t: float,
     end_t: float,
     total_duration: float,
-    max_extension: float = 0.85,
-    tail_hangover: float = 0.25,
+    max_extension: float = 4.0,
+    tail_hangover: float = 0.35,
+    global_noise_floor: float | None = None,
+    min_gap: float = 1.0,
 ) -> float:
     """Trace the acoustic energy (RMS) decay of a detected sound event to prevent cutting off its tail.
 
-    Follows the signal envelope until it merges back into the local ambient noise floor,
-    and applies a natural hangover buffer (default 250ms).
+    Follows the signal envelope until it merges back into the true ambient noise floor,
+    using an audio hold and hangover architecture (default 350ms hangover) so natural
+    modulations and pauses do not prematurely truncate the conclusion.
     """
     if audio is None or len(audio) == 0:
         return min(total_duration, end_t + tail_hangover)
@@ -861,16 +953,22 @@ def refine_event_tail(
     win_len = int(0.025 * sr)  # 25 ms analysis window
     hop_len = int(0.010 * sr)  # 10 ms step
 
-    # 1. Estimate local ambient noise floor (RMS) before event onset
-    bg_start = max(0, int((start_t - 2.0) * sr))
-    bg_end = max(0, int((start_t - 0.08) * sr))
-    if bg_end - bg_start >= win_len:
-        bg_chunk = audio[bg_start:bg_end]
-        bg_rms = [float(np.sqrt(np.mean(bg_chunk[i:i + win_len] ** 2)))
-                  for i in range(0, len(bg_chunk) - win_len, hop_len)]
-        noise_floor = float(np.percentile(bg_rms, 30)) if bg_rms else 1e-4
-    else:
-        noise_floor = 1e-4
+    if global_noise_floor is None or global_noise_floor <= 0:
+        global_noise_floor = 1e-4
+
+    # 1. Estimate clean local ambient noise floor from surroundings without polluting with the event itself
+    bg_samples: list[float] = []
+    for s_off, e_off in [(-5.0, -0.3), (0.5, 5.0)]:
+        bs = max(0, int((start_t + s_off) * sr))
+        be = min(len(audio), int((end_t + e_off) * sr))
+        if be - bs >= win_len:
+            chk = audio[bs:be]
+            for i in range(0, len(chk) - win_len, hop_len * 2):
+                bg_samples.append(float(np.sqrt(np.mean(chk[i:i + win_len] ** 2))))
+
+    local_noise = float(np.percentile(bg_samples, 15)) if bg_samples else global_noise_floor
+    noise_floor = min(local_noise, global_noise_floor * 1.5) if global_noise_floor else local_noise
+    noise_floor = max(noise_floor, 1e-4)
 
     # 2. Estimate event peak energy
     ev_start = max(0, int(start_t * sr))
@@ -883,8 +981,9 @@ def refine_event_tail(
     else:
         peak_rms = noise_floor
 
-    # Dynamic decay threshold: noise floor + 10% of event dynamic range
-    decay_threshold = noise_floor + 0.10 * max(0.0, peak_rms - noise_floor)
+    dynamic_range = max(0.0, peak_rms - noise_floor)
+    # Decay threshold: true acoustic activity threshold (~3-4 dB above ambient noise floor)
+    decay_threshold = max(noise_floor * 1.45, noise_floor + 0.020 * dynamic_range, 0.005)
 
     # 3. Trace forward from (end_t - 0.20s) up to (end_t + max_extension)
     search_start = max(0, int((end_t - 0.20) * sr))
@@ -901,27 +1000,26 @@ def refine_event_tail(
         times.append(t)
         rms_vals.append(r)
 
-    # Find where RMS drops below decay_threshold and stays low for >= 70ms (7 frames)
-    refined_end = end_t
+    # Audio hold & hangover: keep gate open through natural micro-pauses (e.g. 350-400ms)
+    hold_sec = min(0.40, max(0.25, min_gap * 0.40))
+    silence_frames_needed = max(15, int(hold_sec / 0.010))
     consecutive_low = 0
-    found_silence = False
+    last_active_t = end_t
+
     for t, r in zip(times, rms_vals):
-        if t >= end_t:
-            if r <= decay_threshold:
-                consecutive_low += 1
-                if consecutive_low >= 7:
-                    refined_end = (t - (7 * 0.010)) + tail_hangover
-                    found_silence = True
-                    break
-            else:
-                consecutive_low = 0
-                refined_end = t + tail_hangover
+        if t < end_t:
+            if r > decay_threshold:
+                last_active_t = max(last_active_t, t)
+            continue
+        if r > decay_threshold:
+            last_active_t = t
+            consecutive_low = 0
+        else:
+            consecutive_low += 1
+            if consecutive_low >= silence_frames_needed:
+                break
 
-    if not found_silence and times:
-        refined_end = max(end_t + tail_hangover, refined_end)
-
-    # Never make shorter than original detected end_t
-    refined_end = max(end_t, refined_end)
+    refined_end = max(end_t, last_active_t + tail_hangover)
     return min(total_duration, refined_end)
 
 
@@ -938,7 +1036,8 @@ def detect_events(
     min_confidence: float = 0.0,
     audio: np.ndarray | None = None,
     sr: int = YAMNET_SAMPLE_RATE,
-    tail_hangover: float = 0.25,
+    tail_hangover: float = 0.35,
+    max_tail_extension: float = 4.0,
 ) -> list[AudioEvent]:
     """Turn per-frame scores into full-length padded, merged events with confidence scores."""
     print("[3/4] Post-processing detections ...")
@@ -994,12 +1093,17 @@ def detect_events(
             continue
         # Expand backward to find true onset where signal emerges from background
         left = trig
-        while left > 0 and target_scores[left - 1] >= release_threshold and not visited[left - 1]:
+        while left > 0 and (target_scores[left - 1] >= release_threshold or (left > 1 and target_scores[left - 2] >= release_threshold and target_scores[left - 1] >= release_threshold * 0.5)) and not visited[left - 1]:
             left -= 1
-        # Expand forward to trace the acoustic decay
+        # Expand forward to trace the acoustic decay with 1-frame micro-dip lookahead
         right = trig
-        while right < n_frames - 1 and target_scores[right + 1] >= release_threshold:
-            right += 1
+        while right < n_frames - 1:
+            if target_scores[right + 1] >= release_threshold:
+                right += 1
+            elif right < n_frames - 2 and target_scores[right + 2] >= release_threshold and target_scores[right + 1] >= release_threshold * 0.4:
+                right += 2
+            else:
+                break
 
         visited[left:right + 1] = True
 
@@ -1019,23 +1123,41 @@ def detect_events(
         else:
             merged.append([s, e, c])
 
-    # Refine acoustic decay / conclusion using raw audio envelope tracking if audio is provided
+    # Refine acoustic decay / conclusion and onset using raw audio envelope tracking if audio is provided
     if audio is not None and len(audio) > 0:
+        global_noise_floor = calculate_track_noise_floor(audio, sr)
         for i in range(len(merged)):
             s, e, c = merged[i]
-            max_ext = 0.85
+            max_ext = max_tail_extension
             if i + 1 < len(merged):
                 gap_to_next = merged[i + 1][0] - e
                 if gap_to_next > 0.1:
-                    max_ext = min(0.85, gap_to_next - 0.05)
+                    max_ext = min(max_tail_extension, gap_to_next - 0.05)
                 else:
                     max_ext = 0.0
+
+            pre_roll = 1.5
+            if i > 0:
+                gap_from_prev = s - merged[i - 1][1]
+                if gap_from_prev > 0.1:
+                    pre_roll = min(1.5, gap_from_prev - 0.05)
+                else:
+                    pre_roll = 0.0
+
             if max_ext > 0.0:
                 refined_e = refine_event_tail(
                     audio, sr, s, e, total_duration,
-                    max_extension=max_ext, tail_hangover=tail_hangover
+                    max_extension=max_ext, tail_hangover=tail_hangover,
+                    global_noise_floor=global_noise_floor, min_gap=min_gap,
                 )
                 merged[i][1] = refined_e
+
+            if pre_roll > 0.0:
+                refined_s = refine_event_onset(
+                    audio, sr, s, e,
+                    max_pre_roll=pre_roll, noise_floor=global_noise_floor,
+                )
+                merged[i][0] = refined_s
 
         # Re-merge in case tail refinement closed a narrow gap
         re_merged: list[list[float]] = []
@@ -1090,6 +1212,79 @@ def complement_intervals(
     if total_duration - cursor >= MIN_KEEP_SEGMENT:
         segments.append((cursor, total_duration))
     return segments
+
+
+def get_video_duration(video_path: Path, ffmpeg_exe: str) -> float:
+    """Return video duration in seconds using ffprobe or ffmpeg."""
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        cmd = [
+            ffprobe, "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            if res.returncode == 0 and res.stdout.strip():
+                return float(res.stdout.strip())
+        except Exception:
+            pass
+
+    cmd = [ffmpeg_exe, "-i", str(video_path)]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        import re
+        m = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", res.stderr or "")
+        if m:
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception:
+        pass
+    return 0.0
+
+
+def parse_events_file(path: Path) -> list[tuple[float, float]]:
+    """Parse intervals from a JSON file ([[s, e], ...] or [{'start': s, 'end': e}, ...])
+    or plain text lines (start-end). Returns sorted (start, end) tuples."""
+    content = path.read_text(encoding="utf-8").strip()
+    try:
+        data = json.loads(content)
+        intervals: list[tuple[float, float]] = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    s, e = float(item[0]), float(item[1])
+                    if e > s:
+                        intervals.append((s, e))
+                elif isinstance(item, dict) and "start" in item and "end" in item:
+                    s, e = float(item["start"]), float(item["end"])
+                    if e > s:
+                        intervals.append((s, e))
+            if intervals:
+                return sorted(intervals, key=lambda x: x[0])
+    except Exception:
+        pass
+
+    # Line-by-line fallback
+    intervals = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("-")
+        if len(parts) == 2:
+            try:
+                def _parse_sec(tok: str) -> float:
+                    tok = tok.strip()
+                    if ":" in tok:
+                        m, s = tok.split(":", 1)
+                        return float(m) * 60.0 + float(s)
+                    return float(tok)
+                s = _parse_sec(parts[0])
+                e = _parse_sec(parts[1])
+                if e > s:
+                    intervals.append((s, e))
+            except ValueError:
+                pass
+    return sorted(intervals, key=lambda x: x[0])
 
 
 def export_cut_ffmpeg(
@@ -1151,7 +1346,7 @@ def export_cut_ffmpeg(
             die(f"FFmpeg concat failed for '{label}': {p.stderr.decode('utf-8', errors='replace')[-300:]}")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "AutoCut — Detect sound events in a video and export two cuts: "
@@ -1169,8 +1364,11 @@ def parse_args() -> argparse.Namespace:
         "--pad", type=float, default=0.5,
         help="seconds of context kept around each detected event (default: 0.5)")
     parser.add_argument(
-        "--tail-hangover", type=float, default=0.25,
-        help="seconds of natural acoustic hangover added to the decaying conclusion of detected events (default: 0.25)")
+        "--tail-hangover", type=float, default=0.35,
+        help="seconds of natural acoustic hangover added to the decaying conclusion of detected events (default: 0.35)")
+    parser.add_argument(
+        "--max-tail-extension", type=float, default=4.0,
+        help="maximum seconds to trace forward the acoustic decay of an event (default: 4.0)")
     parser.add_argument(
         "--threshold", type=float, default=0.5,
         help="detection confidence threshold, 0.0–1.0 (default: 0.5). "
@@ -1227,6 +1425,20 @@ def parse_args() -> argparse.Namespace:
         "--no-cut", action="store_true",
         help="scan and train the model without exporting video cuts (fast iteration).")
     parser.add_argument(
+        "--export", "--export-mode",
+        dest="export",
+        choices=["both", "events", "clean"],
+        default="both",
+        help="what cuts to export: 'both' (events only + clean cut, default), "
+             "'events' (only detected events), or 'clean' (only clean cut without events).")
+    parser.add_argument(
+        "--events-file", "--cut-intervals",
+        dest="events_file",
+        type=Path,
+        default=None,
+        help="cut video directly from approved event intervals in a JSON or text file, "
+             "skipping audio detection.")
+    parser.add_argument(
         "--info", action="store_true",
         help="print the environment summary (Python, library versions, "
              "ffmpeg) and exit.")
@@ -1246,7 +1458,7 @@ def parse_args() -> argparse.Namespace:
              "preview it, mark events, pick the detection mode and parameters, "
              "run with live progress and browse the results. Requires no "
              "extra dependencies (stdlib only).")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -1282,6 +1494,63 @@ def main() -> None:
     stem = video_path.stem
     events_only_path = outdir / f"{stem}_events_only.mp4"
     clean_path = outdir / f"{stem}_clean.mp4"
+
+    export_events = args.export in ("both", "events")
+    export_clean = args.export in ("both", "clean")
+
+    if args.events_file:
+        if not args.events_file.is_file():
+            die(f"Events file not found: {args.events_file}")
+        intervals = parse_events_file(args.events_file)
+        if not intervals:
+            print("\nNo approved events found — nothing to cut.")
+            return
+
+        print(f"\n      Loaded {len(intervals)} approved event(s) from {args.events_file.name}:")
+        for i, (st, en) in enumerate(intervals, 1):
+            dur = en - st
+            print(f"        {i:2d}. {st:7.2f} s → {en:7.2f} s ({dur:.2f} s)")
+
+        event_total = sum(en - st for st, en in intervals)
+        total_duration = get_video_duration(video_path, ffmpeg_exe)
+        if total_duration > 0:
+            print(f"      Total approved event duration: {event_total:.1f} s / {total_duration:.1f} s")
+        else:
+            print(f"      Total approved event duration: {event_total:.1f} s")
+
+        if args.safe:
+            print("      --safe: encoding with veryfast preset (cooler).")
+
+        if export_events:
+            export_cut_ffmpeg(
+                video_path=video_path,
+                intervals=intervals,
+                out_path=events_only_path,
+                label="events only",
+                ffmpeg_exe=ffmpeg_exe,
+                safe=args.safe,
+            )
+
+        if export_clean:
+            if total_duration <= 0:
+                total_duration = max(en for _, en in intervals) + 1.0
+            events_objs = [AudioEvent(start=s, end=e, confidence=1.0) for s, e in intervals]
+            clean_intervals = complement_intervals(events_objs, total_duration)
+            export_cut_ffmpeg(
+                video_path=video_path,
+                intervals=clean_intervals,
+                out_path=clean_path,
+                label="clean video",
+                ffmpeg_exe=ffmpeg_exe,
+                safe=args.safe,
+            )
+
+        print(f"\nDone!")
+        if export_events:
+            print(f"  Events only : {events_only_path}")
+        if export_clean:
+            print(f"  Clean video : {clean_path}")
+        return
 
     with tempfile.TemporaryDirectory(prefix="autocut_") as tmp:
         wav_path = Path(tmp) / "audio.wav"
@@ -1408,6 +1677,7 @@ def main() -> None:
             audio=audio,
             sr=YAMNET_SAMPLE_RATE,
             tail_hangover=args.tail_hangover,
+            max_tail_extension=args.max_tail_extension,
         )
 
         if not events:
@@ -1432,33 +1702,40 @@ def main() -> None:
             print("\nDone! (Scan only)")
             return
 
-        # 4. Build and write both cuts
+        # 4. Build and write cuts
         if args.safe:
             print("      --safe: encoding with veryfast preset (cooler).")
-        clean_intervals = complement_intervals(events, total_duration)
 
-        event_intervals = [(ev.start, ev.end) for ev in events]
-        export_cut_ffmpeg(
-            video_path=video_path,
-            intervals=event_intervals,
-            out_path=events_only_path,
-            label="events only",
-            ffmpeg_exe=ffmpeg_exe,
-            safe=args.safe,
-        )
+        export_events = args.export in ("both", "events")
+        export_clean = args.export in ("both", "clean")
 
-        export_cut_ffmpeg(
-            video_path=video_path,
-            intervals=clean_intervals,
-            out_path=clean_path,
-            label="clean video",
-            ffmpeg_exe=ffmpeg_exe,
-            safe=args.safe,
-        )
+        if export_events:
+            event_intervals = [(ev.start, ev.end) for ev in events]
+            export_cut_ffmpeg(
+                video_path=video_path,
+                intervals=event_intervals,
+                out_path=events_only_path,
+                label="events only",
+                ffmpeg_exe=ffmpeg_exe,
+                safe=args.safe,
+            )
+
+        if export_clean:
+            clean_intervals = complement_intervals(events, total_duration)
+            export_cut_ffmpeg(
+                video_path=video_path,
+                intervals=clean_intervals,
+                out_path=clean_path,
+                label="clean video",
+                ffmpeg_exe=ffmpeg_exe,
+                safe=args.safe,
+            )
 
     print(f"\nDone!")
-    print(f"  Events only : {events_only_path}")
-    print(f"  Clean video : {clean_path}")
+    if export_events:
+        print(f"  Events only : {events_only_path}")
+    if export_clean:
+        print(f"  Clean video : {clean_path}")
 
 
 if __name__ == "__main__":

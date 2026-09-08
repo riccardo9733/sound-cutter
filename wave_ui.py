@@ -702,6 +702,7 @@ WAVE_JS = r"""
     // 4b. Highlight Regions: AI Detected Results (in Glowing Amber / Gold)
     if (timelineMode === 'results' || timelineMode === 'both') {
       (detectedResults || []).forEach(function (it, idx) {
+        if (it.deleted || it.excluded) return;
         var s = it.start !== undefined ? it.start : (typeof it[0] === 'number' ? it[0] : 0);
         var e = it.end !== undefined ? it.end : (typeof it[1] === 'number' ? it[1] : 0);
         var x1 = timeToX(s, W), x2 = timeToX(e, W);
@@ -855,6 +856,7 @@ WAVE_JS = r"""
     // Draw detected results markers on minimap
     if (timelineMode === 'results' || timelineMode === 'both') {
       (detectedResults || []).forEach(function (it) {
+        if (it.deleted || it.excluded) return;
         var s = it.start !== undefined ? it.start : (typeof it[0] === 'number' ? it[0] : 0);
         var e = it.end !== undefined ? it.end : (typeof it[1] === 'number' ? it[1] : 0);
         var x1 = (s / dur) * mW, x2 = (e / dur) * mW;
@@ -1417,6 +1419,7 @@ WAVE_JS = r"""
     draw();
   };
   w.getResults = function () { return detectedResults; };
+  w.getCurrentEventIndex = function () { return currentEventIndex; };
   w.setTimelineMode = function (m) {
     timelineMode = m;
     updateModeButtons();
