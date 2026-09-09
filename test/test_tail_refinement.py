@@ -39,6 +39,28 @@ class TestTailRefinement(unittest.TestCase):
         self.assertGreater(refined_end, 2.8)
         self.assertLessEqual(refined_end, total_dur)
 
+    def test_merge_safety_cap(self):
+        # 10 discrete triggers spaced 0.8s apart (min_gap=1.0s)
+        # Without a safety cap, all 10 would merge into a single 20s event.
+        # With the safety cap, events must not exceed max_merge_duration (10.0s).
+        scores = np.zeros(100, dtype=np.float32)
+        # Place triggers every 4 frames (each frame is ~0.48s)
+        for i in range(10, 60, 4):
+            scores[i] = 0.9
+
+        events = autocut.detect_events(
+            scores=scores,
+            hop_seconds=0.48,
+            threshold=0.5,
+            min_gap=2.5,
+            min_duration=0.3,
+            pad=0.0,
+            total_duration=50.0,
+        )
+        self.assertGreater(len(events), 1)
+        for ev in events:
+            self.assertLessEqual(ev.duration, 10.0)
+
 
 if __name__ == '__main__':
     unittest.main()

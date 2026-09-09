@@ -794,7 +794,7 @@ PAGE = r"""<!doctype html>
       </div>
       <div>
         <label>Coda / Hangover (s)</label>
-        <input type="number" id="tailHangover" value="0.35" min="0" step="0.05" title="Buffer acustico naturale per non troncare la conclusione/decadimento del suono">
+        <input type="number" id="tailHangover" value="0.25" min="0" step="0.05" title="Buffer acustico naturale per non troncare la conclusione/decadimento del suono">
       </div>
       <div>
         <label>Unisci se vicini &lt; (s)</label>
@@ -1230,7 +1230,7 @@ function collectParams() {
     min_confidence: ($('minConfSlider') && parseFloat($('minConfSlider').value) > 0) ? (parseFloat($('minConfSlider').value) / 100.0) : 0.0,
     sound_type: $('soundType').value,
     pad: parseFloat($('pad').value),
-    tail_hangover: $('tailHangover') ? parseFloat($('tailHangover').value) : 0.35,
+    tail_hangover: $('tailHangover') ? parseFloat($('tailHangover').value) : 0.25,
     min_gap: parseFloat($('minGap').value),
     min_duration: parseFloat($('minDur').value),
     max_duration: $('maxDur').value ? parseFloat($('maxDur').value) : null,

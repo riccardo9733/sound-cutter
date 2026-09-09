@@ -888,7 +888,7 @@ def refine_event_onset(
     sr: int,
     start_t: float,
     end_t: float,
-    max_pre_roll: float = 1.5,
+    max_pre_roll: float = 0.4,
     noise_floor: float = 1e-4,
 ) -> float:
     """Trace backwards from start_t to capture the emergence of the sound event from ambient noise."""
@@ -936,15 +936,15 @@ def refine_event_tail(
     start_t: float,
     end_t: float,
     total_duration: float,
-    max_extension: float = 4.0,
-    tail_hangover: float = 0.35,
+    max_extension: float = 1.0,
+    tail_hangover: float = 0.25,
     global_noise_floor: float | None = None,
     min_gap: float = 1.0,
 ) -> float:
     """Trace the acoustic energy (RMS) decay of a detected sound event to prevent cutting off its tail.
 
     Follows the signal envelope until it merges back into the true ambient noise floor,
-    using an audio hold and hangover architecture (default 350ms hangover) so natural
+    using an audio hold and hangover architecture (default 250ms hangover) so natural
     modulations and pauses do not prematurely truncate the conclusion.
     """
     if audio is None or len(audio) == 0:
@@ -1036,8 +1036,8 @@ def detect_events(
     min_confidence: float = 0.0,
     audio: np.ndarray | None = None,
     sr: int = YAMNET_SAMPLE_RATE,
-    tail_hangover: float = 0.35,
-    max_tail_extension: float = 4.0,
+    tail_hangover: float = 0.25,
+    max_tail_extension: float = 1.0,
 ) -> list[AudioEvent]:
     """Turn per-frame scores into full-length padded, merged events with confidence scores."""
     print("[3/4] Post-processing detections ...")
@@ -1074,8 +1074,8 @@ def detect_events(
 
     # Adaptive Hysteresis (Schmitt trigger):
     # Trigger event on threshold (high), track the decaying tail until release_threshold (low).
-    # Uses a gentle release floor (0.04 or 25% of threshold) to avoid cutting off decaying acoustic tails.
-    release_threshold = max(0.04, threshold * 0.25)
+    # Tightened release floor to prevent expanding across background speech / room noise.
+    release_threshold = max(0.06, threshold * 0.30)
 
     trigger_indices = np.where(target_scores >= threshold)[0]
     if len(trigger_indices) == 0:
@@ -1093,17 +1093,12 @@ def detect_events(
             continue
         # Expand backward to find true onset where signal emerges from background
         left = trig
-        while left > 0 and (target_scores[left - 1] >= release_threshold or (left > 1 and target_scores[left - 2] >= release_threshold and target_scores[left - 1] >= release_threshold * 0.5)) and not visited[left - 1]:
+        while left > 0 and target_scores[left - 1] >= release_threshold and not visited[left - 1]:
             left -= 1
-        # Expand forward to trace the acoustic decay with 1-frame micro-dip lookahead
+        # Expand forward to trace the acoustic decay cleanly without skipping across silence/speech
         right = trig
-        while right < n_frames - 1:
-            if target_scores[right + 1] >= release_threshold:
-                right += 1
-            elif right < n_frames - 2 and target_scores[right + 2] >= release_threshold and target_scores[right + 1] >= release_threshold * 0.4:
-                right += 2
-            else:
-                break
+        while right < n_frames - 1 and target_scores[right + 1] >= release_threshold:
+            right += 1
 
         visited[left:right + 1] = True
 
@@ -1114,10 +1109,14 @@ def detect_events(
 
     raw_intervals.sort(key=lambda x: x[0])
 
-    # Merge events closer than min_gap
+    # Maximum duration allowed for a single merged event cluster (safety cap)
+    # Default 10.0s for short sound events, or max_duration if user explicitly set one
+    max_merge_duration = max_duration if (max_duration is not None and max_duration > 0) else 10.0
+
+    # Merge events closer than min_gap, respecting safety duration cap
     merged: list[list[float]] = []
     for s, e, c in raw_intervals:
-        if merged and s - merged[-1][1] <= min_gap:
+        if merged and s - merged[-1][1] <= min_gap and (max(merged[-1][1], e) - merged[-1][0] <= max_merge_duration):
             merged[-1][1] = max(merged[-1][1], e)
             merged[-1][2] = max(merged[-1][2], c)
         else:
@@ -1136,11 +1135,11 @@ def detect_events(
                 else:
                     max_ext = 0.0
 
-            pre_roll = 1.5
+            pre_roll = 0.4
             if i > 0:
                 gap_from_prev = s - merged[i - 1][1]
                 if gap_from_prev > 0.1:
-                    pre_roll = min(1.5, gap_from_prev - 0.05)
+                    pre_roll = min(0.4, gap_from_prev - 0.05)
                 else:
                     pre_roll = 0.0
 
@@ -1159,10 +1158,10 @@ def detect_events(
                 )
                 merged[i][0] = refined_s
 
-        # Re-merge in case tail refinement closed a narrow gap
+        # Re-merge in case tail refinement closed a narrow gap, respecting safety duration cap
         re_merged: list[list[float]] = []
         for s, e, c in merged:
-            if re_merged and s - re_merged[-1][1] <= min_gap:
+            if re_merged and s - re_merged[-1][1] <= min_gap and (max(re_merged[-1][1], e) - re_merged[-1][0] <= max_merge_duration):
                 re_merged[-1][1] = max(re_merged[-1][1], e)
                 re_merged[-1][2] = max(re_merged[-1][2], c)
             else:
@@ -1170,15 +1169,23 @@ def detect_events(
         merged = re_merged
 
     # Pad, clamp, and filter duration.
-    # Merge any newly overlapping padded regions.
+    # Merge any newly overlapping padded regions without exceeding max_merge_duration.
     padded: list[AudioEvent] = []
     for start, end, c in merged:
         start_padded = max(0.0, start - pad)
         end_padded = min(total_duration, end + pad)
         if end_padded - start_padded >= min_duration:
             if padded and start_padded <= padded[-1].end:
-                padded[-1].end = max(padded[-1].end, end_padded)
-                padded[-1].confidence = max(padded[-1].confidence, c)
+                if max(padded[-1].end, end_padded) - padded[-1].start <= max_merge_duration:
+                    padded[-1].end = max(padded[-1].end, end_padded)
+                    padded[-1].confidence = max(padded[-1].confidence, c)
+                else:
+                    # Prevent runaway merge: split overlap at boundary
+                    split_t = (padded[-1].end + start_padded) / 2.0
+                    padded[-1].end = max(padded[-1].start + min_duration, split_t)
+                    start_padded = min(end_padded - min_duration, split_t)
+                    if end_padded - start_padded >= min_duration:
+                        padded.append(AudioEvent(start_padded, end_padded, confidence=c))
             else:
                 padded.append(AudioEvent(start_padded, end_padded, confidence=c))
 
@@ -1364,11 +1371,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--pad", type=float, default=0.5,
         help="seconds of context kept around each detected event (default: 0.5)")
     parser.add_argument(
-        "--tail-hangover", type=float, default=0.35,
-        help="seconds of natural acoustic hangover added to the decaying conclusion of detected events (default: 0.35)")
+        "--tail-hangover", type=float, default=0.25,
+        help="seconds of natural acoustic hangover added to the decaying conclusion of detected events (default: 0.25)")
     parser.add_argument(
-        "--max-tail-extension", type=float, default=4.0,
-        help="maximum seconds to trace forward the acoustic decay of an event (default: 4.0)")
+        "--max-tail-extension", type=float, default=1.0,
+        help="maximum seconds to trace forward the acoustic decay of an event (default: 1.0)")
     parser.add_argument(
         "--threshold", type=float, default=0.5,
         help="detection confidence threshold, 0.0–1.0 (default: 0.5). "
