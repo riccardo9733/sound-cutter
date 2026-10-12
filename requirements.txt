@@ -5,3 +5,4 @@ moviepy>=1.0.3,<2.0.0
 certifi
 # tensorflow-hub still imports pkg_resources, removed from setuptools 81+
 setuptools<81
+yt-dlp>=2024.0.0

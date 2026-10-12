@@ -41,6 +41,28 @@ except ImportError:
     pass
 
 from wave_ui import WAVE_JS, serve_wave
+from twitch_dl import (
+    TWITCH_JOB,
+    ensure_twitch_cli,
+    find_ffmpeg,
+    find_twitch_cli,
+    load_saved_oauth,
+    save_oauth_token,
+)
+from youtube_dl import (
+    YOUTUBE_JOB,
+    YOUTUBE_PIPELINE_JOB,
+    fetch_video_info,
+    fetch_playlist_info,
+    get_available_models,
+    ensure_ffmpeg_in_path,
+)
+from file_mgr import (
+    get_project_tree,
+    reveal_in_os,
+    delete_project_file,
+    rename_project_file,
+)
 
 ROOT = Path(__file__).resolve().parent
 AUTOCUT_SCRIPT = ROOT / "autocut.py"
@@ -76,7 +98,7 @@ def list_files() -> dict:
     """Discover media files and saved models under the project folder."""
     videos: list[str] = []
     models: list[str] = []
-    for base in (ROOT, ROOT / "models", ROOT / "test"):
+    for base in (ROOT, ROOT / "models", ROOT / "test", ROOT / "downloads"):
         if not base.is_dir():
             continue
         for p in sorted(base.iterdir(), key=lambda q: q.name.lower()):
@@ -422,32 +444,601 @@ PAGE = r"""<!doctype html>
 <style>
   :root { --bg:#101114; --panel:#191b20; --border:#2a2d35; --txt:#e8e8ea;
           --muted:#9aa0a8; --accent:#2a6df4; --green:#1e9e4a; --red:#d64541;
-          --amber:#f4a72a; }
+          --amber:#f4a72a; --twitch:#9146ff; --twitch-hover:#a970ff; }
   * { box-sizing: border-box; }
-  body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI",
-         Roboto, sans-serif; background:var(--bg); color:var(--txt); }
-  header { padding:12px 24px; border-bottom:1px solid var(--border);
-           display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; }
-  header h1 { font-size:19px; margin:0; }
-  header p { margin:0; color:var(--muted); font-size:12px; }
-  .grid { display:grid; grid-template-columns: minmax(480px, 1.65fr) 315px minmax(380px, 1.15fr); gap:16px;
-          padding:14px 20px 40px; width:100%; max-width:100%; margin:0; }
+  html, body {
+    height: 100vh;
+    max-height: 100vh;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--txt);
+  }
+  header {
+    flex-shrink: 0;
+    padding: 8px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header p { margin: 0; color: var(--muted); font-size: 12px; }
+
+  /* Sleek scrollbars */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2a2e38; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3f4554; }
+
+  .nav-tabs {
+    display: inline-flex;
+    background: #090a0d;
+    padding: 3px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    gap: 4px;
+  }
+  .nav-tab {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .nav-tab:hover {
+    color: var(--txt);
+    background: rgba(255,255,255,0.05);
+  }
+  .nav-tab.active {
+    background: #232733;
+    color: #fff;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+  }
+  .nav-tab.active.twitch-active {
+    background: rgba(145, 70, 255, 0.2);
+    color: #d8b4fe;
+    border: 1px solid rgba(145, 70, 255, 0.4);
+  }
+  .tab-pane {
+    display: none;
+    flex: 1;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+  }
+  .tab-pane.active {
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Twitch Layout */
+  .twitch-grid {
+    display: grid;
+    grid-template-columns: minmax(440px, 1.25fr) minmax(380px, 1fr);
+    gap: 16px;
+    padding: 12px 20px 14px;
+    width: 100%;
+    margin: 0;
+    flex: 1;
+    min-height: 0;
+    height: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  @media (max-width: 1080px) {
+    .twitch-grid {
+      grid-template-columns: 1fr;
+      overflow-y: auto;
+    }
+  }
+  .twitch-col-left {
+    overflow-y: auto;
+    max-height: 100%;
+    min-height: 0;
+    padding-right: 6px;
+  }
+  .twitch-col-right {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  .btn-twitch {
+    background: linear-gradient(135deg, #9146ff 0%, #772ce8 100%);
+    color: #fff;
+    font-weight: 600;
+    padding: 9px 18px;
+    font-size: 13px;
+    border: 1px solid rgba(145, 70, 255, 0.4);
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.15s ease;
+  }
+  .btn-twitch:hover {
+    filter: brightness(1.15);
+    box-shadow: 0 4px 14px rgba(145, 70, 255, 0.35);
+  }
+  .twitch-progress-wrap {
+    background: #0d0e12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-top: 8px;
+    flex-shrink: 0;
+  }
+  .twitch-bar-bg {
+    background: #191b22;
+    height: 12px;
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+    margin: 8px 0 6px;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  .twitch-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #9146ff, #38bdf8);
+    border-radius: 6px;
+    transition: width 0.25s ease;
+  }
+  .stage-badge {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(145, 70, 255, 0.18);
+    color: #c084fc;
+    border: 1px solid rgba(145, 70, 255, 0.3);
+  }
+  .ready-card {
+    background: linear-gradient(135deg, rgba(34, 197, 94, 0.14), rgba(16, 185, 129, 0.06));
+    border: 1px solid rgba(34, 197, 94, 0.4);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-top: 12px;
+    display: none;
+    flex-shrink: 0;
+  }
+
+  .nav-tab.active.youtube-active {
+    background: rgba(239, 68, 68, 0.2);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+  }
+
+  /* YouTube Layout */
+  .youtube-grid {
+    display: grid;
+    grid-template-columns: minmax(440px, 1.25fr) minmax(380px, 1fr);
+    gap: 16px;
+    padding: 12px 20px 14px;
+    width: 100%;
+    margin: 0;
+    flex: 1;
+    min-height: 0;
+    height: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  @media (max-width: 1080px) {
+    .youtube-grid {
+      grid-template-columns: 1fr;
+      overflow-y: auto;
+    }
+  }
+  .youtube-col-left {
+    overflow-y: auto;
+    max-height: 100%;
+    min-height: 0;
+    padding-right: 6px;
+  }
+  .youtube-col-right {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+  }
+  .btn-youtube {
+    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+    color: #fff;
+    font-weight: 600;
+    padding: 9px 18px;
+    font-size: 13px;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.15s ease;
+  }
+  .btn-youtube:hover {
+    filter: brightness(1.15);
+    box-shadow: 0 4px 14px rgba(239, 68, 68, 0.35);
+  }
+  .youtube-progress-wrap {
+    background: #0d0e12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-top: 8px;
+    flex-shrink: 0;
+  }
+  .youtube-bar-bg {
+    background: #191b22;
+    height: 12px;
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+    margin: 8px 0 6px;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  .youtube-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #ef4444, #f97316);
+    border-radius: 6px;
+    transition: width 0.25s ease;
+  }
+  .yt-thumb-card {
+    display: none;
+    background: #14161b;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    margin: 8px 0 12px;
+    gap: 12px;
+    align-items: center;
+  }
+  .yt-thumb-card.active {
+    display: flex;
+  }
+  .yt-stats-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .yt-mode-selector {
+    display: inline-flex;
+    gap: 6px;
+    margin-bottom: 10px;
+    background: #14161b;
+    padding: 4px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+  .yt-submode-btn {
+    background: transparent;
+    color: var(--muted);
+    border: none;
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .yt-submode-btn:hover {
+    color: var(--txt);
+  }
+  .yt-submode-btn.active {
+    background: #ef4444;
+    color: #fff;
+    box-shadow: 0 2px 8px rgba(239, 68, 68, 0.4);
+  }
+  .btn-pipeline {
+    background: linear-gradient(135deg, #f97316 0%, #ea580c 100%);
+    color: #fff;
+    font-weight: 600;
+    padding: 9px 18px;
+    font-size: 13px;
+    border: 1px solid rgba(249, 115, 22, 0.4);
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.15s ease;
+  }
+  .btn-pipeline:hover {
+    filter: brightness(1.15);
+    box-shadow: 0 4px 14px rgba(249, 115, 22, 0.35);
+  }
+  .btn-pipeline:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    filter: none;
+    box-shadow: none;
+  }
+
+  .nav-tab.active.files-active {
+    background: rgba(56, 189, 248, 0.2);
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.4);
+  }
+
+  /* File Manager Layout */
+  .files-grid {
+    display: grid;
+    grid-template-columns: 310px 1fr;
+    gap: 16px;
+    padding: 12px 20px 14px;
+    width: 100%;
+    margin: 0;
+    flex: 1;
+    min-height: 0;
+    height: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  @media (max-width: 960px) {
+    .files-grid {
+      grid-template-columns: 1fr;
+      overflow-y: auto;
+    }
+  }
+  .fm-sidebar {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+  }
+  .fm-folder-list {
+    flex: 1;
+    overflow-y: auto;
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-right: 4px;
+  }
+  .fm-folder-btn {
+    background: #14161b;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    color: var(--txt);
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .fm-folder-btn:hover {
+    background: #1f232b;
+    border-color: #38bdf8;
+  }
+  .fm-folder-btn.active {
+    background: rgba(56, 189, 248, 0.15);
+    border-color: #38bdf8;
+    color: #38bdf8;
+    font-weight: 600;
+  }
+  .fm-badge {
+    background: #252830;
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 10px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .fm-folder-btn.active .fm-badge {
+    background: rgba(56, 189, 248, 0.25);
+    color: #bae6fd;
+  }
+
+  .fm-main-area {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+  }
+  .fm-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .fm-files-container {
+    flex: 1;
+    overflow-y: auto;
+    margin-top: 10px;
+    padding-right: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .fm-file-card {
+    background: #14161b;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    transition: all 0.15s ease;
+  }
+  .fm-file-card:hover {
+    background: #191c22;
+    border-color: #3f4554;
+  }
+  .fm-file-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--txt);
+    word-break: break-all;
+    line-height: 1.3;
+  }
+  .fm-file-sub {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 3px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  .fm-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .btn-fm {
+    background: #232733;
+    border: 1px solid var(--border);
+    color: var(--txt);
+    font-size: 11px;
+    padding: 5px 9px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-weight: 500;
+  }
+  .btn-fm:hover {
+    background: #313645;
+    border-color: #4b5563;
+  }
+  .btn-fm-autocut {
+    background: rgba(42, 109, 244, 0.2);
+    border-color: rgba(42, 109, 244, 0.5);
+    color: #93c5fd;
+    font-weight: 600;
+  }
+  .btn-fm-autocut:hover {
+    background: rgba(42, 109, 244, 0.4);
+  }
+  .btn-fm-danger:hover {
+    background: rgba(239, 68, 68, 0.25);
+    border-color: #ef4444;
+    color: #fca5a5;
+  }
+
+  /* Modal preview */
+  .fm-modal-backdrop {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(4px);
+    z-index: 9999;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .fm-modal-backdrop.active {
+    display: flex;
+  }
+  .fm-modal-box {
+    background: #16181f;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    max-width: 800px;
+    width: 100%;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+  }
+
+  /* AutoCut Layout */
+  .grid {
+    display: grid;
+    grid-template-columns: minmax(460px, 1.6fr) 320px minmax(370px, 1.15fr);
+    gap: 16px;
+    padding: 12px 20px 14px;
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    flex: 1;
+    min-height: 0;
+    height: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
   @media (max-width: 1350px) {
-    .grid { grid-template-columns: 1.2fr 1fr; }
+    .grid { grid-template-columns: 1.2fr 1fr; overflow-y: auto; }
     .col-results { grid-column: 1 / -1; }
   }
   @media (max-width: 860px) {
-    .grid { grid-template-columns: 1fr; }
+    .grid { grid-template-columns: 1fr; overflow-y: auto; }
     .col-results { grid-column: auto; }
   }
-  section { background:var(--panel); border:1px solid var(--border);
-            border-radius:10px; padding:16px; }
-  .col-results { display:flex; flex-direction:column; }
-  .col-results ul.events { flex:1; min-height:300px; max-height:calc(100vh - 340px); overflow-y:auto; }
-  .col-results ul.events li { padding:5px 8px; font-size:12px; gap:4px; }
-  section h2 { margin:0 0 12px; font-size:15px; color:var(--muted);
-               font-weight:600; letter-spacing:.4px; }
-  video { width:100%; max-height:46vh; background:#000; border-radius:8px; }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .col-video, .col-results, .col-controls {
+    overflow-y: auto;
+    max-height: 100%;
+    min-height: 0;
+    padding-right: 4px;
+  }
+  .col-results { display: flex; flex-direction: column; }
+  .col-results ul.events { flex: 1; min-height: 150px; max-height: 100%; overflow-y: auto; }
+  .col-results ul.events li { padding: 5px 8px; font-size: 12px; gap: 4px; }
+  section h2 { margin: 0 0 10px; font-size: 14px; color: var(--muted); font-weight: 600; letter-spacing: .4px; }
+  video { width: 100%; max-height: 38vh; background: #000; border-radius: 8px; }
+  .scroll-log {
+    flex: 1;
+    min-height: 80px;
+    background: #08090b;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 11px;
+    overflow-y: auto;
+    line-height: 1.45;
+    color: #94a3b8;
+  }
   .time { font-size:20px; font-variant-numeric:tabular-nums; margin:8px 0;
           color:var(--amber); }
   label { font-size:13px; color:var(--muted); display:block; margin:8px 0 3px; }
@@ -648,11 +1239,19 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>✂️ AutoCut</h1>
-  <p>Rileva eventi sonori e genera automaticamente tagli del video: un cut con solo gli eventi e uno pulito senza eventi. Server locale
-     (127.0.0.1) — chiudi con Ctrl+C nel terminale.</p>
+  <div style="display:flex; align-items:center; gap:20px; flex-wrap:wrap">
+    <h1>✂️ AutoCut</h1>
+    <nav class="nav-tabs">
+      <button class="nav-tab active" id="tabBtnAutocut" onclick="switchTab('autocut')">✂️ AutoCut</button>
+      <button class="nav-tab" id="tabBtnYoutube" onclick="switchTab('youtube')"><span style="color:#ef4444">🔴</span> YouTube Downloader</button>
+      <button class="nav-tab" id="tabBtnTwitch" onclick="switchTab('twitch')"><span style="color:#9146ff">🟣</span> Twitch Downloader</button>
+      <button class="nav-tab" id="tabBtnFiles" onclick="switchTab('files')"><span style="color:#38bdf8">📁</span> Gestione File</button>
+    </nav>
+  </div>
+  <p id="headerSubtext">Rileva eventi sonori e genera automaticamente tagli del video: un cut con solo gli eventi e uno pulito senza eventi. Server locale (127.0.0.1).</p>
 </header>
 
+<div id="tab-autocut" class="tab-pane active">
 <div class="grid">
 
   <!-- ============ COLONNA 1 (SINISTRA): video + etichette ============ -->
@@ -852,8 +1451,494 @@ PAGE = r"""<!doctype html>
     </div>
     <div id="status">Nessuna elaborazione in corso.</div>
     <code id="cmd" style="font-size:11px; color:var(--muted)"></code>
-    <div id="log" style="height:170px"></div>
+    <div id="log" class="scroll-log" style="height:130px; flex:none; margin-top:6px"></div>
   </section>
+</div>
+</div><!-- /tab-autocut -->
+
+<!-- ==================== TAB TWITCH DOWNLOADER ==================== -->
+<div id="tab-twitch" class="tab-pane">
+  <div class="twitch-grid">
+    <!-- COLONNA SINISTRA: Parametri download -->
+    <section class="twitch-col-left">
+      <h2>🟣 SCARICA DA TWITCH (VOD & CLIP)</h2>
+      <label>URL o ID del VOD o Clip</label>
+      <div class="row">
+        <input type="text" id="twUrl" placeholder="es. https://www.twitch.tv/videos/123456789 oppure https://clips.twitch.tv/..." style="flex:1">
+        <button id="bTwPaste" title="Incolla dagli appunti">📋 Incolla</button>
+        <button id="bTwClear" title="Svuota">✕</button>
+      </div>
+      <div id="twDetectedType" style="font-size:11px; color:var(--muted); margin:4px 0 10px;">
+        💡 Inserisci l'URL di una replica (VOD) o di una Clip Twitch.
+      </div>
+
+      <div class="param" style="margin-top:10px">
+        <div>
+          <label>Qualità</label>
+          <select id="twQuality">
+            <option value="" selected>Migliore disponibile (Source / Best)</option>
+            <option value="1080p60">1080p60</option>
+            <option value="1080p">1080p</option>
+            <option value="720p60">720p60</option>
+            <option value="720p">720p</option>
+            <option value="480p">480p</option>
+            <option value="360p">360p</option>
+            <option value="160p">160p</option>
+            <option value="audio_only">Solo Audio</option>
+          </select>
+        </div>
+        <div>
+          <label>Thread paralleli (-t)</label>
+          <input type="number" id="twThreads" value="4" min="1" max="16">
+        </div>
+
+        <div>
+          <label>Ritaglio Inizio (-b) <span style="font-size:10px; color:var(--muted)">opzionale</span></label>
+          <input type="text" id="twTrimStart" placeholder="es. 00:10:00 o 600s">
+        </div>
+        <div>
+          <label>Ritaglio Fine (-e) <span style="font-size:10px; color:var(--muted)">opzionale</span></label>
+          <input type="text" id="twTrimEnd" placeholder="es. 00:25:00 o 1500s">
+        </div>
+
+        <div class="full">
+          <label>Nome file personalizzato <span style="font-size:10px; color:var(--muted)">opzionale (.mp4 automatico)</span></label>
+          <input type="text" id="twFilename" placeholder="es. torneo_finale (lascia vuoto per nome automatico)">
+        </div>
+
+        <div class="full">
+          <label>Cartella di destinazione</label>
+          <input type="text" id="twOutdir" value="downloads" placeholder="downloads (all'interno del progetto)">
+        </div>
+
+        <div class="full">
+          <details style="margin:4px 0; cursor:pointer">
+            <summary style="font-size:12px; color:var(--muted)">🔑 Opzioni Avanzate (Token OAuth per VOD per soli abbonati)</summary>
+            <div style="margin-top:6px; padding:10px; background:#14161b; border:1px solid var(--border); border-radius:6px">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px">
+                <label style="margin:0">Token OAuth Twitch (cookie auth-token)</label>
+                <span id="twOauthStatus" style="font-size:11px; color:#4ade80; font-weight:600"></span>
+              </div>
+              <div class="row">
+                <input type="password" id="twOauth" placeholder="es. oauth:abc123xyz... oppure valore del cookie auth-token" style="flex:1">
+                <button id="bTwSaveOauth" title="Salva permanentemente in file locale .twitch_oauth">💾 Salva</button>
+                <button id="bTwClearOauth" title="Rimuovi token salvato">🗑️ Rimuovi</button>
+              </div>
+              <div style="font-size:11px; color:var(--muted); margin-top:6px">
+                🔒 <b>Salvataggio locale:</b> Il token viene salvato nel file protetto <code>.twitch_oauth</code> e caricato automaticamente ad ogni avvio.
+              </div>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:16px; gap:8px">
+        <button class="btn-twitch" id="bTwDownload">🟣 Avvia Download</button>
+        <button class="btn-stop" id="bTwStop" disabled>⏹ Interrompi</button>
+        <span id="twSysInfo" style="font-size:11px; color:var(--muted); margin-left:auto"></span>
+      </div>
+
+      <!-- Card Risultato Pronto -->
+      <div class="ready-card" id="twReadyCard">
+        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
+          <div>
+            <div style="font-weight:700; color:#4ade80; font-size:14px; margin-bottom:4px">
+              🎉 Video scaricato con successo!
+            </div>
+            <div id="twReadyFilename" style="font-size:12px; color:var(--txt); font-family:ui-monospace, Menlo, monospace"></div>
+          </div>
+          <button class="btn-run" id="bTwOpenAutoCut" style="font-size:13px; padding:8px 14px">
+            🎬 Apri direttamente in AutoCut ➔
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- COLONNA DESTRA: Monitoraggio, Avanzamento e Log -->
+    <section class="twitch-col-right">
+      <h2>STATO E AVANZAMENTO LIVE</h2>
+      
+      <div class="twitch-progress-wrap">
+        <div style="display:flex; justify-content:space-between; align-items:center">
+          <span class="stage-badge" id="twStageBadge">In attesa</span>
+          <span style="font-size:15px; font-weight:700; font-variant-numeric:tabular-nums; color:#38bdf8" id="twPctText">0%</span>
+        </div>
+        <div class="twitch-bar-bg">
+          <div class="twitch-bar-fill" id="twBarFill"></div>
+        </div>
+        <div id="twCmdPreview" style="font-size:11px; color:var(--muted); font-family:ui-monospace, Menlo, monospace; word-break:break-all"></div>
+      </div>
+
+      <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center">
+        <label style="margin:0">Log console TwitchDownloader</label>
+        <button id="bTwClearLog" style="padding:2px 8px; font-size:11px">Svuota log</button>
+      </div>
+      <div id="twLog" class="scroll-log" style="margin-top:6px"></div>
+    </section>
+  </div>
+</div>
+
+<!-- ==================== TAB YOUTUBE DOWNLOADER ==================== -->
+<div id="tab-youtube" class="tab-pane">
+  <div style="padding: 10px 20px 0 20px; display:flex; align-items:center; justify-content:space-between">
+    <div class="yt-mode-selector">
+      <button id="ytModeBtnSingle" class="yt-submode-btn active" onclick="switchYoutubeMode('single')">📹 Singolo Video</button>
+      <button id="ytModeBtnPipeline" class="yt-submode-btn" onclick="switchYoutubeMode('pipeline')">📑 Pipeline Playlist</button>
+    </div>
+    <span id="ytSysInfo" style="font-size:11px; color:var(--muted)"></span>
+  </div>
+
+  <div class="youtube-grid">
+    <!-- COLONNA SINISTRA: Parametri download -->
+    <section class="youtube-col-left">
+      <!-- 1. VISTA SINGOLO VIDEO -->
+      <div id="ytSingleColLeft">
+        <h2>🔴 SCARICA DA YOUTUBE (VIDEO & AUDIO)</h2>
+        <label>URL o Link del Video YouTube</label>
+        <div class="row">
+          <input type="text" id="ytUrl" placeholder="es. https://www.youtube.com/watch?v=... oppure https://youtu.be/..." style="flex:1">
+          <button id="bYtPaste" title="Incolla dagli appunti">📋 Incolla</button>
+          <button id="bYtClear" title="Svuota">✕</button>
+          <button id="bYtInspect" title="Analizza video e carica risoluzioni" style="background:var(--card)">🔍 Analizza</button>
+        </div>
+
+        <!-- Preview card del video caricato -->
+        <div class="yt-thumb-card" id="ytPreviewCard">
+          <img id="ytThumbImg" src="" alt="Thumbnail" style="width:120px; height:68px; object-fit:cover; border-radius:6px; border:1px solid var(--border); flex-shrink:0">
+          <div style="flex:1; min-width:0">
+            <div id="ytVideoTitle" style="font-size:13px; font-weight:700; color:var(--txt); line-height:1.3; overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical"></div>
+            <div style="font-size:11px; color:var(--muted); margin-top:4px; display:flex; gap:10px; flex-wrap:wrap">
+              <span id="ytChannelName"></span>
+              <span id="ytDurationBadge" style="background:#222530; padding:1px 6px; border-radius:3px"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="param" style="margin-top:10px">
+          <div class="full">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px">
+              <label style="margin:0">Qualità / Risoluzione Video</label>
+              <span id="ytQualityHint" style="font-size:11px; color:var(--muted)">Scegli la risoluzione desiderata</span>
+            </div>
+            <select id="ytQuality">
+              <option value="best" selected>⭐ Migliore qualità disponibile (Auto Best - fino a 4K)</option>
+              <option value="2160p">2160p (4K UHD)</option>
+              <option value="1440p">1440p (2K QHD)</option>
+              <option value="1080p">1080p (Full HD)</option>
+              <option value="720p">720p (HD)</option>
+              <option value="480p">480p (SD)</option>
+              <option value="360p">360p</option>
+              <option value="audio_mp3">🎵 Solo Audio (MP3 - alta qualità 320k)</option>
+              <option value="audio_m4a">🎵 Solo Audio (M4A AAC originale)</option>
+            </select>
+          </div>
+
+          <div>
+            <label>Ritaglio Inizio <span style="font-size:10px; color:var(--muted)">opzionale</span></label>
+            <input type="text" id="ytTrimStart" placeholder="es. 00:01:30 o 90s">
+          </div>
+          <div>
+            <label>Ritaglio Fine <span style="font-size:10px; color:var(--muted)">opzionale</span></label>
+            <input type="text" id="ytTrimEnd" placeholder="es. 00:05:00 o 300s">
+          </div>
+
+          <div class="full">
+            <label>Nome file personalizzato <span style="font-size:10px; color:var(--muted)">opzionale</span></label>
+            <input type="text" id="ytFilename" placeholder="Lascia vuoto per usare il titolo originale del video">
+          </div>
+
+          <div class="full">
+            <label>Cartella di destinazione</label>
+            <input type="text" id="ytOutdir" value="downloads" placeholder="downloads (all'interno del progetto)">
+          </div>
+
+          <div class="full">
+            <details style="margin:4px 0; cursor:pointer">
+              <summary style="font-size:12px; color:var(--muted)">⚙️ Opzioni Avanzate (Sottotitoli)</summary>
+              <div style="margin-top:6px; padding:10px; background:#14161b; border:1px solid var(--border); border-radius:6px">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin:0">
+                  <input type="checkbox" id="ytSubtitles" style="cursor:pointer">
+                  <span>Scarica e incorpora sottotitoli (se disponibili)</span>
+                </label>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:16px; gap:8px">
+          <button class="btn-youtube" id="bYtDownload">🔴 Avvia Download</button>
+          <button class="btn-stop" id="bYtStop" disabled>⏹ Interrompi</button>
+        </div>
+
+        <!-- Card Risultato Pronto -->
+        <div class="ready-card" id="ytReadyCard">
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
+            <div>
+              <div style="font-weight:700; color:#4ade80; font-size:14px; margin-bottom:4px">
+                🎉 Video YouTube scaricato con successo!
+              </div>
+              <div id="ytReadyFilename" style="font-size:12px; color:var(--txt); font-family:ui-monospace, Menlo, monospace"></div>
+            </div>
+            <button class="btn-run" id="bYtOpenAutoCut" style="font-size:13px; padding:8px 14px">
+              🎬 Apri direttamente in AutoCut ➔
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. VISTA PIPELINE PLAYLIST -->
+      <div id="ytPipelineColLeft" style="display:none">
+        <h2 style="color:#fb923c">📑 PIPELINE PLAYLIST (DOWNLOAD ➔ ANALISI ➔ TAGLIO ➔ PULIZIA)</h2>
+        <div style="font-size:12px; color:var(--muted); margin-bottom:12px; line-height:1.4">
+          La pipeline scarica in sequenza ciascun video della playlist, rileva i segmenti tramite il modello selezionato, esporta solo il video riassuntivo con i segmenti identificati nella cartella prescelta ed elimina il video originale dal disco.
+        </div>
+
+        <label>URL o Link della Playlist YouTube</label>
+        <div class="row">
+          <input type="text" id="ytPipeUrl" placeholder="es. https://www.youtube.com/playlist?list=... oppure link video con playlist" style="flex:1">
+          <button id="bYtPipePaste" title="Incolla dagli appunti">📋 Incolla</button>
+          <button id="bYtPipeClear" title="Svuota">✕</button>
+          <button id="bYtPipeInspect" title="Carica playlist" style="background:var(--card)">🔍 Carica</button>
+        </div>
+
+        <!-- Preview card playlist -->
+        <div class="yt-thumb-card" id="ytPipePreviewCard">
+          <div style="width:48px; height:48px; border-radius:6px; background:rgba(249, 115, 22, 0.15); border:1px solid rgba(249, 115, 22, 0.35); display:flex; align-items:center; justify-content:center; font-size:22px; flex-shrink:0">📑</div>
+          <div style="flex:1; min-width:0">
+            <div id="ytPipeTitle" style="font-size:13px; font-weight:700; color:var(--txt); line-height:1.3; overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical">Playlist</div>
+            <div style="font-size:11px; color:var(--muted); margin-top:4px; display:flex; gap:10px; flex-wrap:wrap">
+              <span id="ytPipeUploader"></span>
+              <span id="ytPipeCountBadge" style="background:#222530; padding:1px 6px; border-radius:3px"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="param" style="margin-top:10px">
+          <div>
+            <label>Risoluzione Massima Video</label>
+            <select id="ytPipeQuality">
+              <option value="best" selected>⭐ Migliore qualità disponibile (fino a 4K)</option>
+              <option value="1080p">1080p (Full HD)</option>
+              <option value="720p">720p (HD)</option>
+              <option value="480p">480p (SD)</option>
+              <option value="360p">360p (Leggero)</option>
+            </select>
+          </div>
+
+          <div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px">
+              <label style="margin:0">Modello per Analisi Audio</label>
+              <button id="bYtPipeRefreshModels" style="font-size:10px; padding:1px 6px; background:transparent; border:1px solid var(--border)">🔄</button>
+            </div>
+            <select id="ytPipeModel">
+              <option value="yamnet" selected>⭐ YAMNet Predefinito</option>
+            </select>
+          </div>
+
+          <div class="full">
+            <label>Cartella di destinazione per i segmenti tagliati</label>
+            <input type="text" id="ytPipeOutdir" value="results" placeholder="results (salva es. 01 - Titolo_events_only.mp4)">
+            <span style="font-size:11px; color:var(--muted); display:block; margin-top:3px">
+              Salva solo i video tagliati (<code>01 - Titolo_events_only.mp4</code>). L'originale viene eliminato automaticamente per ogni video.
+            </span>
+          </div>
+
+          <div class="full">
+            <details style="margin:4px 0; cursor:pointer">
+              <summary style="font-size:12px; color:var(--muted)">⚙️ Parametri Avanzati di Analisi & Taglio</summary>
+              <div style="margin-top:6px; padding:10px; background:#14161b; border:1px solid var(--border); border-radius:6px; display:grid; grid-template-columns:1fr 1fr; gap:10px">
+                <div>
+                  <label style="font-size:11px">Tipo di suono (se YAMNet)</label>
+                  <select id="ytPipeSoundType">
+                    <option value="laughter" selected>laughter (Risate)</option>
+                    <option value="applause">applause (Applausi)</option>
+                    <option value="speech">speech (Parlato)</option>
+                    <option value="cough">cough (Tosse)</option>
+                    <option value="burp">burp (Rutti)</option>
+                    <option value="fart">fart (Scoregge)</option>
+                  </select>
+                </div>
+                <div>
+                  <label style="font-size:11px">Soglia confidenza (0.1–0.9)</label>
+                  <input type="number" id="ytPipeThreshold" value="0.5" step="0.05" min="0.05" max="0.95">
+                </div>
+                <div>
+                  <label style="font-size:11px">Pad intorno a eventi (s)</label>
+                  <input type="number" id="ytPipePad" value="0.5" step="0.1" min="0">
+                </div>
+                <div>
+                  <label style="font-size:11px">Durata minima evento (s)</label>
+                  <input type="number" id="ytPipeMinDuration" value="0.3" step="0.1" min="0.05">
+                </div>
+                <div style="grid-column: span 2">
+                  <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin:0">
+                    <input type="checkbox" id="ytPipeSafe" style="cursor:pointer">
+                    <span style="font-size:12px">Modalità Safe (encoding leggero CPU per evitare surriscaldamento)</span>
+                  </label>
+                </div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:16px; gap:8px">
+          <button class="btn-pipeline" id="bYtPipeStart">🚀 Avvia Pipeline Playlist</button>
+          <button class="btn-stop" id="bYtPipeStop" disabled>⏹ Interrompi Pipeline</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- COLONNA DESTRA: Monitoraggio, Avanzamento e Log -->
+    <section class="youtube-col-right">
+      <!-- 1. VISTA DESTRA SINGOLO VIDEO -->
+      <div id="ytSingleColRight" style="display:flex; flex-direction:column; height:100%; min-height:0">
+        <h2>STATO E AVANZAMENTO LIVE</h2>
+        <div class="youtube-progress-wrap">
+          <div style="display:flex; justify-content:space-between; align-items:center">
+            <span class="stage-badge" id="ytStageBadge" style="background:rgba(239, 68, 68, 0.18); color:#f87171; border-color:rgba(239, 68, 68, 0.3)">In attesa</span>
+            <span style="font-size:15px; font-weight:700; font-variant-numeric:tabular-nums; color:#f87171" id="ytPctText">0%</span>
+          </div>
+          <div class="youtube-bar-bg">
+            <div class="youtube-bar-fill" id="ytBarFill"></div>
+          </div>
+          <div class="yt-stats-row">
+            <span id="ytSpeedText">Velocità: --</span>
+            <span id="ytSizeText">Dimensione: --</span>
+            <span id="ytEtaText">ETA: --</span>
+          </div>
+          <div id="ytCmdPreview" style="font-size:11px; color:var(--muted); font-family:ui-monospace, Menlo, monospace; word-break:break-all; margin-top:6px"></div>
+        </div>
+
+        <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center">
+          <label style="margin:0">Log console yt-dlp</label>
+          <button id="bYtClearLog" style="padding:2px 8px; font-size:11px">Svuota log</button>
+        </div>
+        <div id="ytLog" class="scroll-log" style="margin-top:6px"></div>
+      </div>
+
+      <!-- 2. VISTA DESTRA PIPELINE PLAYLIST -->
+      <div id="ytPipelineColRight" style="display:none; flex-direction:column; height:100%; min-height:0">
+        <h2>AVANZAMENTO PIPELINE PLAYLIST</h2>
+        <div class="youtube-progress-wrap" style="background:#121318; border-color:rgba(249, 115, 22, 0.3)">
+          <div style="display:flex; justify-content:space-between; align-items:center">
+            <div style="display:flex; align-items:center; gap:8px">
+              <span class="stage-badge" id="ytPipeStageBadge" style="background:rgba(249, 115, 22, 0.18); color:#fb923c; border-color:rgba(249, 115, 22, 0.35)">In attesa</span>
+              <span id="ytPipeCounterText" class="yt-pipe-badge">Video 0 / 0</span>
+            </div>
+            <span style="font-size:16px; font-weight:700; font-variant-numeric:tabular-nums; color:#fb923c" id="ytPipeGlobalPctText">0%</span>
+          </div>
+          <div class="youtube-bar-bg">
+            <div class="youtube-bar-fill" id="ytPipeGlobalBarFill" style="background: linear-gradient(90deg, #f97316, #eab308)"></div>
+          </div>
+          <!-- Video corrente info -->
+          <div style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.06)">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px">
+              <span id="ytPipeCurrentTitle" style="font-size:12px; font-weight:600; color:var(--txt); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:70%">In attesa di avvio...</span>
+              <span id="ytPipeCurrentStageBadge" style="font-size:11px; color:#fb923c">--</span>
+            </div>
+            <div class="yt-stats-row">
+              <span id="ytPipeSpeedText">Velocità: --</span>
+              <span id="ytPipeEtaText">ETA: --</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Sezione video tagliati salvati -->
+        <div id="ytPipeSavedWrap" style="margin-top:10px; display:none">
+          <div style="font-size:12px; font-weight:700; color:#4ade80; margin-bottom:4px">🎉 Video Tagliati Salvati (<span id="ytPipeSavedCount">0</span>):</div>
+          <div id="ytPipeSavedList" style="max-height:110px; overflow-y:auto; background:#14161b; border:1px solid var(--border); border-radius:6px; padding:6px; font-size:11px; font-family:ui-monospace, Menlo, monospace"></div>
+        </div>
+
+        <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center">
+          <label style="margin:0">Log console Pipeline</label>
+          <button id="bYtPipeClearLog" style="padding:2px 8px; font-size:11px">Svuota log</button>
+        </div>
+        <div id="ytPipeLog" class="scroll-log" style="margin-top:6px; flex:1"></div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- ==================== TAB GESTIONE FILE ==================== -->
+<div id="tab-files" class="tab-pane">
+  <div class="files-grid">
+    <!-- COLONNA SINISTRA: Cartelle del progetto -->
+    <aside class="fm-sidebar">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px">
+        <h2 style="margin:0; font-size:14px; font-weight:700">📁 CARTELLE</h2>
+        <button id="bFmReload" class="btn-fm" title="Ricarica elenco file">🔄 Ricarica</button>
+      </div>
+      <div style="font-size:11px; color:var(--muted)">
+        Seleziona una cartella per filtrarne i file:
+      </div>
+
+      <div class="fm-folder-list" id="fmFolderList">
+        <!-- Generato dinamicamente via JS -->
+      </div>
+
+      <div style="margin-top:auto; padding-top:10px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:6px">
+        <button id="bFmOpenProjectFinder" class="btn-fm" style="width:100%; justify-content:center; padding:8px">
+          📂 Mostra cartella progetto nel Finder
+        </button>
+      </div>
+    </aside>
+
+    <!-- COLONNA DESTRA: File della cartella selezionata -->
+    <main class="fm-main-area">
+      <!-- Toolbar superiore -->
+      <div class="fm-toolbar">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
+          <h2 id="fmCurrentFolderTitle" style="margin:0; font-size:15px; font-weight:700">Tutti i File</h2>
+          <span id="fmFolderStatsBadge" class="fm-badge" style="font-size:12px; padding:3px 9px">0 file</span>
+        </div>
+
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap">
+          <!-- Filtro tipo -->
+          <select id="fmTypeFilter" style="padding:5px 8px; font-size:12px; border-radius:4px">
+            <option value="all">Tutti i tipi</option>
+            <option value="video">🎬 Solo Video</option>
+            <option value="audio">🎵 Solo Audio</option>
+            <option value="model">🧠 Modelli (.npz)</option>
+            <option value="text">📄 Testo / Altro</option>
+          </select>
+
+          <!-- Ricerca -->
+          <div style="position:relative; width:220px">
+            <input type="text" id="fmSearchInput" placeholder="🔍 Cerca nome file..." style="width:100%; padding:5px 8px; font-size:12px; border-radius:4px">
+          </div>
+        </div>
+      </div>
+
+      <!-- Elenco file -->
+      <div class="fm-files-container" id="fmFilesContainer">
+        <!-- Generato dinamicamente -->
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- Modal Anteprima Media -->
+<div class="fm-modal-backdrop" id="fmMediaModal">
+  <div class="fm-modal-box">
+    <div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between">
+      <div style="display:flex; align-items:center; gap:8px">
+        <span id="fmModalIcon" style="font-size:16px">🎬</span>
+        <div id="fmModalTitle" style="font-size:13px; font-weight:700; color:var(--txt); word-break:break-all"></div>
+      </div>
+      <button id="bFmCloseModal" class="btn-fm" style="font-size:13px; padding:2px 8px">✕</button>
+    </div>
+    <div style="background:#090a0d; display:flex; align-items:center; justify-content:center; min-height:240px; max-height:55vh; overflow:hidden">
+      <video id="fmModalVideo" controls style="max-width:100%; max-height:50vh; display:none"></video>
+      <audio id="fmModalAudio" controls style="width:80%; display:none"></audio>
+    </div>
+    <div style="padding:10px 16px; border-top:1px solid var(--border); display:flex; align-items:center; justify-content:space-between">
+      <span id="fmModalMeta" style="font-size:11px; color:var(--muted)"></span>
+      <div style="display:flex; gap:8px">
+        <button id="bFmModalOpenAutoCut" class="btn-fm btn-fm-autocut">🎬 Apri in AutoCut</button>
+        <button id="bFmModalDownload" class="btn-fm">⬇️ Scarica</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1636,7 +2721,1130 @@ function esc(s) {
   return d.innerHTML;
 }
 
+/* ---------- Schede di navigazione ---------- */
+function switchTab(name) {
+  const isTwitch = (name === 'twitch');
+  const isYoutube = (name === 'youtube');
+  const isFiles = (name === 'files');
+  const isAutocut = (!isTwitch && !isYoutube && !isFiles);
+
+  $('tabBtnAutocut').classList.toggle('active', isAutocut);
+  $('tabBtnTwitch').classList.toggle('active', isTwitch);
+  $('tabBtnTwitch').classList.toggle('twitch-active', isTwitch);
+  $('tabBtnYoutube').classList.toggle('active', isYoutube);
+  $('tabBtnYoutube').classList.toggle('youtube-active', isYoutube);
+  $('tabBtnFiles').classList.toggle('active', isFiles);
+  $('tabBtnFiles').classList.toggle('files-active', isFiles);
+
+  $('tab-autocut').classList.toggle('active', isAutocut);
+  $('tab-twitch').classList.toggle('active', isTwitch);
+  $('tab-youtube').classList.toggle('active', isYoutube);
+  $('tab-files').classList.toggle('active', isFiles);
+
+  if (isFiles) {
+    $('headerSubtext').textContent = 'Gestisci, visualizza, riproduci o elimina i file suddivisi per cartelle del progetto (downloads, results, models, ecc.).';
+    loadFileManager();
+  } else if (isYoutube) {
+    $('headerSubtext').textContent = 'Scarica video singoli o processa intere playlist con AutoCut (download, analisi, taglio e pulizia automatica).';
+    checkYoutubeSystem();
+    loadPipelineModels();
+  } else if (isTwitch) {
+    $('headerSubtext').textContent = 'Scarica repliche (VOD) o clip da Twitch usando TwitchDownloaderCLI e inviale direttamente ad AutoCut.';
+    checkTwitchSystem();
+  } else {
+    $('headerSubtext').textContent = 'Rileva eventi sonori e genera automaticamente tagli del video: un cut con solo gli eventi e uno pulito senza eventi. Server locale (127.0.0.1).';
+  }
+}
+
+/* ---------- Twitch Downloader Client ---------- */
+let twPollTimer = null;
+let twSince = 0;
+let twLastOutputFile = null;
+
+function checkTwitchSystem() {
+  fetch('/api/twitch/check').then(r => r.json()).then(d => {
+    let msg = [];
+    if (d.cli) msg.push('⚡ CLI: pronta');
+    else msg.push('⏳ CLI: download automatico al primo avvio');
+    if (d.ffmpeg) msg.push('🎬 FFmpeg: pronto');
+    else msg.push('⚠️ FFmpeg: non rilevato');
+    $('twSysInfo').textContent = msg.join(' | ');
+  }).catch(() => {});
+  loadTwitchOAuth();
+}
+
+function loadTwitchOAuth() {
+  fetch('/api/twitch/oauth').then(r => r.json()).then(d => {
+    if (d.oauth) {
+      $('twOauth').value = d.oauth;
+      $('twOauthStatus').textContent = '✅ Salvato in .twitch_oauth';
+      $('twOauthStatus').style.color = '#4ade80';
+    } else {
+      $('twOauthStatus').textContent = 'Nessun token salvato';
+      $('twOauthStatus').style.color = 'var(--muted)';
+    }
+  }).catch(() => {});
+}
+
+$('bTwSaveOauth').onclick = (e) => {
+  e.preventDefault();
+  const val = $('twOauth').value.trim();
+  fetch('/api/twitch/oauth', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({oauth: val})
+  }).then(r => r.json()).then(d => {
+    if (val) {
+      $('twOauthStatus').textContent = '✅ Salvato in .twitch_oauth';
+      $('twOauthStatus').style.color = '#4ade80';
+    } else {
+      $('twOauthStatus').textContent = '🗑️ Token rimosso';
+      $('twOauthStatus').style.color = 'var(--muted)';
+    }
+  }).catch(err => alert('Errore salvataggio token: ' + err));
+};
+
+$('bTwClearOauth').onclick = (e) => {
+  e.preventDefault();
+  $('twOauth').value = '';
+  fetch('/api/twitch/oauth', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({oauth: ''})
+  }).then(() => {
+    $('twOauthStatus').textContent = '🗑️ Token rimosso';
+    $('twOauthStatus').style.color = 'var(--muted)';
+  }).catch(() => {});
+};
+
+$('twUrl').addEventListener('input', () => {
+  const u = $('twUrl').value.trim().toLowerCase();
+  if (!u) {
+    $('twDetectedType').innerHTML = '💡 Inserisci l\'URL di una replica (VOD) o di una Clip Twitch.';
+  } else if (u.includes('clip') || u.includes('/clip/')) {
+    $('twDetectedType').innerHTML = '🎯 <b>Clip Twitch rilevata</b> (verrà usata la modalità <code>clipdownload</code>).';
+  } else if (u.includes('/videos/') || /^\d+$/.test(u)) {
+    $('twDetectedType').innerHTML = '📺 <b>VOD Stream Twitch rilevato</b> (verrà usata la modalità <code>videodownload</code> con supporto ritaglio).';
+  } else {
+    $('twDetectedType').innerHTML = '🟣 Formato riconosciuto: Twitch media.';
+  }
+});
+
+$('bTwPaste').onclick = async () => {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) {
+      $('twUrl').value = text.trim();
+      $('twUrl').dispatchEvent(new Event('input'));
+    }
+  } catch(e) {
+    const t = prompt('Incolla l\'URL di Twitch:');
+    if (t) {
+      $('twUrl').value = t.trim();
+      $('twUrl').dispatchEvent(new Event('input'));
+    }
+  }
+};
+
+$('bTwClear').onclick = () => {
+  $('twUrl').value = '';
+  $('twUrl').dispatchEvent(new Event('input'));
+};
+
+$('bTwClearLog').onclick = () => {
+  $('twLog').innerHTML = '';
+};
+
+$('bTwDownload').onclick = () => {
+  const url = $('twUrl').value.trim();
+  if (!url) {
+    alert('Inserisci l\'URL o l\'ID del video/clip Twitch.');
+    $('twUrl').focus();
+    return;
+  }
+
+  const payload = {
+    url: url,
+    quality: $('twQuality').value,
+    threads: parseInt($('twThreads').value, 10) || 4,
+    trim_start: $('twTrimStart').value.trim(),
+    trim_end: $('twTrimEnd').value.trim(),
+    filename: $('twFilename').value.trim(),
+    outdir: $('twOutdir').value.trim() || 'downloads',
+    oauth: $('twOauth') ? $('twOauth').value.trim() : '',
+  };
+
+  $('bTwDownload').disabled = true;
+  $('bTwStop').disabled = false;
+  $('twReadyCard').style.display = 'none';
+  $('twLog').innerHTML = '';
+  twSince = 0;
+  twLastOutputFile = null;
+  $('twPctText').textContent = '0%';
+  $('twBarFill').style.width = '0%';
+  $('twStageBadge').textContent = 'Avvio...';
+  $('twCmdPreview').textContent = '';
+
+  fetch('/api/twitch/download', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }).then(r => r.json()).then(d => {
+    if (d.error) {
+      alert(d.error);
+      $('bTwDownload').disabled = false;
+      $('bTwStop').disabled = true;
+      $('twStageBadge').textContent = 'Errore';
+      return;
+    }
+    if (twPollTimer) clearInterval(twPollTimer);
+    twPollTimer = setInterval(pollTwitchStatus, 600);
+    pollTwitchStatus();
+  }).catch(err => {
+    alert('Errore nella richiesta di download: ' + err);
+    $('bTwDownload').disabled = false;
+    $('bTwStop').disabled = true;
+  });
+};
+
+$('bTwStop').onclick = () => {
+  if (!confirm('Vuoi interrompere il download di Twitch?')) return;
+  fetch('/api/twitch/stop', {method: 'POST'}).catch(() => {});
+};
+
+function pollTwitchStatus() {
+  fetch('/api/twitch/status?since=' + twSince).then(r => r.json()).then(d => {
+    twSince += (d.lines || []).length;
+    if (d.lines && d.lines.length) {
+      const logBox = $('twLog');
+      for (const line of d.lines) {
+        const row = document.createElement('div');
+        row.textContent = line;
+        if (line.includes('❌') || line.toLowerCase().includes('errore')) {
+          row.style.color = 'var(--red)';
+        } else if (line.includes('🎉') || line.includes('✅')) {
+          row.style.color = '#4ade80';
+        } else if (line.includes('🚀') || line.includes('🎬')) {
+          row.style.color = '#60a5fa';
+        }
+        logBox.appendChild(row);
+      }
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    if (d.command) {
+      $('twCmdPreview').textContent = d.command;
+    }
+
+    if (d.stage) {
+      $('twStageBadge').textContent = d.stage;
+    }
+
+    const pct = Math.max(0, Math.min(100, d.progress || 0));
+    $('twPctText').textContent = pct + '%';
+    $('twBarFill').style.width = pct + '%';
+
+    if (!d.running) {
+      if (twPollTimer) {
+        clearInterval(twPollTimer);
+        twPollTimer = null;
+      }
+      $('bTwDownload').disabled = false;
+      $('bTwStop').disabled = true;
+
+      if (d.done && d.output_file) {
+        twLastOutputFile = d.output_file;
+        $('twReadyCard').style.display = 'block';
+        $('twReadyFilename').textContent = 'Percorso: ' + d.output_file;
+        $('twBarFill').style.width = '100%';
+        $('twPctText').textContent = '100%';
+        $('twStageBadge').textContent = 'Completato!';
+        loadFiles(); // aggiorna l'elenco dei video in AutoCut
+      } else if (d.cancelled) {
+        $('twStageBadge').textContent = 'Interrotto';
+      } else if (d.error) {
+        $('twStageBadge').textContent = 'Errore: ' + (d.error.length > 50 ? d.error.slice(0, 48) + '…' : d.error);
+        $('twStageBadge').style.background = 'rgba(239, 68, 68, 0.2)';
+        $('twStageBadge').style.color = '#f87171';
+        $('twStageBadge').style.borderColor = 'rgba(239, 68, 68, 0.4)';
+      }
+    }
+  }).catch(() => {});
+}
+
+function openInAutoCut(path) {
+  if (!path) return;
+  switchTab('autocut');
+  loadFiles();
+  $('videoPath').value = path;
+  selectVideo(path);
+}
+
+$('bTwOpenAutoCut').onclick = () => {
+  if (twLastOutputFile) {
+    openInAutoCut(twLastOutputFile);
+  }
+};
+
+/* ---------- YouTube Downloader Client ---------- */
+let ytPollTimer = null;
+let ytSince = 0;
+let ytLastOutputFile = null;
+let ytInspectDebounce = null;
+let ytCurrentUrl = '';
+
+function checkYoutubeSystem() {
+  fetch('/api/youtube/check').then(r => r.json()).then(d => {
+    let msg = [];
+    if (d.ytdlp) msg.push('⚡ yt-dlp: pronto');
+    else msg.push('⚠️ yt-dlp: non trovato');
+    if (d.ffmpeg) msg.push('🎬 FFmpeg: pronto');
+    else msg.push('⚠️ FFmpeg: non rilevato');
+    $('ytSysInfo').textContent = msg.join(' | ');
+  }).catch(() => {});
+}
+
+function inspectYoutubeVideo(url) {
+  const targetUrl = (url || $('ytUrl').value || '').trim();
+  if (!targetUrl || (!targetUrl.includes('youtube.com') && !targetUrl.includes('youtu.be'))) {
+    $('ytPreviewCard').classList.remove('active');
+    return;
+  }
+  if (targetUrl === ytCurrentUrl && $('ytPreviewCard').classList.contains('active')) {
+    return;
+  }
+
+  $('ytQualityHint').textContent = '⏳ Analisi video e risoluzioni in corso...';
+  $('bYtInspect').disabled = true;
+
+  fetch('/api/youtube/info', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url: targetUrl})
+  }).then(r => r.json()).then(data => {
+    $('bYtInspect').disabled = false;
+    if (data.error) {
+      $('ytQualityHint').textContent = '⚠️ ' + data.error;
+      return;
+    }
+    ytCurrentUrl = targetUrl;
+    // Update preview card
+    if (data.thumbnail) {
+      $('ytThumbImg').src = data.thumbnail;
+      $('ytThumbImg').style.display = 'block';
+    } else {
+      $('ytThumbImg').style.display = 'none';
+    }
+    $('ytVideoTitle').textContent = data.title || 'Video YouTube';
+    $('ytChannelName').textContent = '👤 ' + (data.uploader || 'YouTube');
+    $('ytDurationBadge').textContent = '⏱️ ' + (data.duration_str || '--:--');
+    $('ytPreviewCard').classList.add('active');
+
+    // Populate resolutions select
+    const sel = $('ytQuality');
+    sel.innerHTML = '';
+
+    // Auto Best option
+    const optBest = document.createElement('option');
+    optBest.value = 'best';
+    optBest.textContent = '⭐ Migliore qualità video (Auto Best - fino a 4K)';
+    sel.appendChild(optBest);
+
+    if (data.resolutions && data.resolutions.length) {
+      for (const res of data.resolutions) {
+        const opt = document.createElement('option');
+        opt.value = res.value;
+        opt.textContent = '🎬 ' + res.label;
+        sel.appendChild(opt);
+      }
+    } else {
+      // Fallback standards
+      const defaults = ['1080p', '720p', '480p', '360p'];
+      defaults.forEach(d => {
+        const opt = document.createElement('option');
+        opt.value = d;
+        opt.textContent = '🎬 ' + d;
+        sel.appendChild(opt);
+      });
+    }
+
+    // Audio options
+    const optMp3 = document.createElement('option');
+    optMp3.value = 'audio_mp3';
+    optMp3.textContent = '🎵 Solo Audio (MP3 - alta qualità 320k)';
+    sel.appendChild(optMp3);
+
+    const optM4a = document.createElement('option');
+    optM4a.value = 'audio_m4a';
+    optM4a.textContent = '🎵 Solo Audio (M4A AAC originale)';
+    sel.appendChild(optM4a);
+
+    $('ytQualityHint').textContent = '✅ Risoluzioni caricate (' + (data.resolutions ? data.resolutions.length : 0) + ' disponibili)';
+  }).catch(err => {
+    $('bYtInspect').disabled = false;
+    $('ytQualityHint').textContent = 'Errore analisi: ' + err;
+  });
+}
+
+$('ytUrl').addEventListener('input', () => {
+  if (ytInspectDebounce) clearTimeout(ytInspectDebounce);
+  ytInspectDebounce = setTimeout(() => {
+    inspectYoutubeVideo();
+  }, 700);
+});
+
+$('bYtInspect').onclick = (e) => {
+  e.preventDefault();
+  inspectYoutubeVideo();
+};
+
+$('bYtPaste').onclick = async () => {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) {
+      $('ytUrl').value = text.trim();
+      inspectYoutubeVideo(text.trim());
+    }
+  } catch(e) {
+    const t = prompt('Incolla l\'URL di YouTube:');
+    if (t) {
+      $('ytUrl').value = t.trim();
+      inspectYoutubeVideo(t.trim());
+    }
+  }
+};
+
+$('bYtClear').onclick = () => {
+  $('ytUrl').value = '';
+  ytCurrentUrl = '';
+  $('ytPreviewCard').classList.remove('active');
+  $('ytQualityHint').textContent = 'Incolla il link per caricare le risoluzioni';
+};
+
+$('bYtClearLog').onclick = () => {
+  $('ytLog').innerHTML = '';
+};
+
+$('bYtDownload').onclick = () => {
+  const url = $('ytUrl').value.trim();
+  if (!url) {
+    alert('Inserisci l\'URL del video YouTube.');
+    $('ytUrl').focus();
+    return;
+  }
+
+  const payload = {
+    url: url,
+    quality: $('ytQuality').value,
+    trim_start: $('ytTrimStart').value.trim(),
+    trim_end: $('ytTrimEnd').value.trim(),
+    filename: $('ytFilename').value.trim(),
+    outdir: $('ytOutdir').value.trim() || 'downloads',
+    subtitles: $('ytSubtitles').checked,
+  };
+
+  $('bYtDownload').disabled = true;
+  $('bYtStop').disabled = false;
+  $('ytReadyCard').style.display = 'none';
+  $('ytLog').innerHTML = '';
+  ytSince = 0;
+  ytLastOutputFile = null;
+  $('ytPctText').textContent = '0%';
+  $('ytBarFill').style.width = '0%';
+  $('ytStageBadge').textContent = 'Avvio...';
+  $('ytCmdPreview').textContent = '';
+  $('ytSpeedText').textContent = 'Velocità: --';
+  $('ytSizeText').textContent = 'Dimensione: --';
+  $('ytEtaText').textContent = 'ETA: --';
+
+  fetch('/api/youtube/download', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }).then(r => r.json()).then(d => {
+    if (d.error) {
+      alert(d.error);
+      $('bYtDownload').disabled = false;
+      $('bYtStop').disabled = true;
+      $('ytStageBadge').textContent = 'Errore';
+      return;
+    }
+    if (ytPollTimer) clearInterval(ytPollTimer);
+    ytPollTimer = setInterval(pollYoutubeStatus, 350);
+    pollYoutubeStatus();
+  }).catch(err => {
+    alert('Errore nella richiesta di download: ' + err);
+    $('bYtDownload').disabled = false;
+    $('bYtStop').disabled = true;
+  });
+};
+
+$('bYtStop').onclick = () => {
+  if (!confirm('Vuoi interrompere il download di YouTube?')) return;
+  fetch('/api/youtube/stop', {method: 'POST'}).catch(() => {});
+};
+
+function pollYoutubeStatus() {
+  fetch('/api/youtube/status?since=' + ytSince).then(r => r.json()).then(d => {
+    ytSince += (d.lines || []).length;
+    if (d.lines && d.lines.length) {
+      const logBox = $('ytLog');
+      for (const line of d.lines) {
+        const row = document.createElement('div');
+        row.textContent = line;
+        if (line.includes('❌') || line.toLowerCase().includes('error')) {
+          row.style.color = 'var(--red)';
+        } else if (line.includes('🎉') || line.includes('✅')) {
+          row.style.color = '#4ade80';
+        } else if (line.includes('🚀') || line.includes('🎬')) {
+          row.style.color = '#60a5fa';
+        }
+        logBox.appendChild(row);
+      }
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    if (d.command) {
+      $('ytCmdPreview').textContent = d.command;
+    }
+    if (d.stage) {
+      $('ytStageBadge').textContent = d.stage;
+    }
+    if (d.speed) {
+      $('ytSpeedText').textContent = 'Velocità: ' + d.speed;
+    }
+    if (d.downloaded || d.total) {
+      $('ytSizeText').textContent = 'Dimensione: ' + (d.downloaded || '0') + (d.total ? ' / ' + d.total : '');
+    }
+    if (d.eta) {
+      $('ytEtaText').textContent = 'ETA: ' + d.eta;
+    }
+
+    const pctNum = Math.max(0, Math.min(100, Number(d.progress) || 0));
+    $('ytPctText').textContent = (pctNum === 0 || pctNum === 100) ? Math.round(pctNum) + '%' : pctNum.toFixed(1) + '%';
+    $('ytBarFill').style.width = pctNum + '%';
+
+    if (!d.running) {
+      if (ytPollTimer) {
+        clearInterval(ytPollTimer);
+        ytPollTimer = null;
+      }
+      $('bYtDownload').disabled = false;
+      $('bYtStop').disabled = true;
+
+      if (d.done && d.output_file) {
+        ytLastOutputFile = d.output_file;
+        $('ytReadyCard').style.display = 'block';
+        $('ytReadyFilename').textContent = 'Percorso: ' + d.output_file;
+        $('ytBarFill').style.width = '100%';
+        $('ytPctText').textContent = '100%';
+        $('ytStageBadge').textContent = 'Completato!';
+        loadFiles(); // aggiorna l'elenco dei video in AutoCut
+      } else if (d.cancelled) {
+        $('ytStageBadge').textContent = 'Interrotto';
+      } else if (d.error) {
+        $('ytStageBadge').textContent = 'Errore: ' + (d.error.length > 50 ? d.error.slice(0, 48) + '…' : d.error);
+        $('ytStageBadge').style.background = 'rgba(239, 68, 68, 0.2)';
+        $('ytStageBadge').style.color = '#f87171';
+        $('ytStageBadge').style.borderColor = 'rgba(239, 68, 68, 0.4)';
+      }
+    }
+  }).catch(() => {});
+}
+
+$('bYtOpenAutoCut').onclick = () => {
+  if (ytLastOutputFile) {
+    openInAutoCut(ytLastOutputFile);
+  }
+};
+
+/* ---------- YouTube Playlist Pipeline Client ---------- */
+let ytPipePollTimer = null;
+let ytPipeSince = 0;
+let ytPipeInspectDebounce = null;
+let ytPipeCurrentUrl = '';
+
+function switchYoutubeMode(mode) {
+  const isPipe = (mode === 'pipeline');
+  $('ytModeBtnSingle').classList.toggle('active', !isPipe);
+  $('ytModeBtnPipeline').classList.toggle('active', isPipe);
+
+  $('ytSingleColLeft').style.display = isPipe ? 'none' : 'block';
+  $('ytPipelineColLeft').style.display = isPipe ? 'block' : 'none';
+  $('ytSingleColRight').style.display = isPipe ? 'none' : 'flex';
+  $('ytPipelineColRight').style.display = isPipe ? 'flex' : 'none';
+
+  if (isPipe) {
+    loadPipelineModels();
+    pollYoutubePipelineStatus();
+  }
+}
+
+function loadPipelineModels() {
+  fetch('/api/youtube/models').then(r => r.json()).then(models => {
+    const sel = $('ytPipeModel');
+    if (!sel) return;
+    const currentVal = sel.value;
+    sel.innerHTML = '';
+    (models || []).forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.name;
+      sel.appendChild(opt);
+    });
+    if (currentVal && Array.from(sel.options).some(o => o.value === currentVal)) {
+      sel.value = currentVal;
+    }
+  }).catch(() => {});
+}
+
+if ($('bYtPipeRefreshModels')) {
+  $('bYtPipeRefreshModels').onclick = (e) => {
+    e.preventDefault();
+    loadPipelineModels();
+  };
+}
+
+function normalizePlaylistUrl(u) {
+  try {
+    const parsed = new URL(u);
+    if ((parsed.hostname.includes('youtube.com') || parsed.hostname.includes('youtu.be')) && parsed.searchParams.has('list')) {
+      const listId = parsed.searchParams.get('list');
+      if (listId) return 'https://www.youtube.com/playlist?list=' + listId;
+    }
+  } catch(e) {}
+  return u;
+}
+
+function inspectYoutubePlaylist(url) {
+  let targetUrl = (url || $('ytPipeUrl').value || '').trim();
+  if (!targetUrl || (!targetUrl.includes('youtube.com') && !targetUrl.includes('youtu.be'))) {
+    $('ytPipePreviewCard').classList.remove('active');
+    return;
+  }
+  targetUrl = normalizePlaylistUrl(targetUrl);
+  if ($('ytPipeUrl') && $('ytPipeUrl').value !== targetUrl) {
+    $('ytPipeUrl').value = targetUrl;
+  }
+  if (targetUrl === ytPipeCurrentUrl && $('ytPipePreviewCard').classList.contains('active')) {
+    return;
+  }
+
+  $('bYtPipeInspect').disabled = true;
+  fetch('/api/youtube/playlist/info', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url: targetUrl})
+  }).then(r => r.json()).then(data => {
+    $('bYtPipeInspect').disabled = false;
+    if (data.error) {
+      alert('Errore caricamento playlist: ' + data.error);
+      return;
+    }
+    ytPipeCurrentUrl = targetUrl;
+    $('ytPipeTitle').textContent = data.title || 'Playlist YouTube';
+    $('ytPipeUploader').textContent = '👤 ' + (data.uploader || 'YouTube');
+    $('ytPipeCountBadge').textContent = '📑 ' + (data.video_count || 0) + ' video';
+    $('ytPipePreviewCard').classList.add('active');
+  }).catch(err => {
+    $('bYtPipeInspect').disabled = false;
+    alert('Errore analisi playlist: ' + err);
+  });
+}
+
+if ($('ytPipeUrl')) {
+  $('ytPipeUrl').addEventListener('input', () => {
+    if (ytPipeInspectDebounce) clearTimeout(ytPipeInspectDebounce);
+    ytPipeInspectDebounce = setTimeout(() => {
+      inspectYoutubePlaylist();
+    }, 700);
+  });
+}
+
+if ($('bYtPipeInspect')) {
+  $('bYtPipeInspect').onclick = (e) => {
+    e.preventDefault();
+    inspectYoutubePlaylist();
+  };
+}
+
+if ($('bYtPipePaste')) {
+  $('bYtPipePaste').onclick = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        $('ytPipeUrl').value = text.trim();
+        inspectYoutubePlaylist(text.trim());
+      }
+    } catch(e) {
+      const t = prompt('Incolla l\'URL della playlist YouTube:');
+      if (t) {
+        $('ytPipeUrl').value = t.trim();
+        inspectYoutubePlaylist(t.trim());
+      }
+    }
+  };
+}
+
+if ($('bYtPipeClear')) {
+  $('bYtPipeClear').onclick = () => {
+    $('ytPipeUrl').value = '';
+    ytPipeCurrentUrl = '';
+    $('ytPipePreviewCard').classList.remove('active');
+  };
+}
+
+if ($('bYtPipeClearLog')) {
+  $('bYtPipeClearLog').onclick = () => {
+    $('ytPipeLog').innerHTML = '';
+  };
+}
+
+if ($('bYtPipeStart')) {
+  $('bYtPipeStart').onclick = () => {
+    const url = $('ytPipeUrl').value.trim();
+    if (!url) {
+      alert('Inserisci l\'URL della playlist YouTube.');
+      $('ytPipeUrl').focus();
+      return;
+    }
+
+    const payload = {
+      url: url,
+      quality: $('ytPipeQuality').value,
+      model: $('ytPipeModel').value,
+      outdir: $('ytPipeOutdir').value.trim() || 'results',
+      sound_type: $('ytPipeSoundType').value,
+      threshold: $('ytPipeThreshold').value,
+      pad: $('ytPipePad').value,
+      min_duration: $('ytPipeMinDuration').value,
+      safe: $('ytPipeSafe').checked,
+    };
+
+    $('bYtPipeStart').disabled = true;
+    $('bYtPipeStop').disabled = false;
+    $('ytPipeLog').innerHTML = '';
+    $('ytPipeSavedWrap').style.display = 'none';
+    $('ytPipeSavedList').innerHTML = '';
+    ytPipeSince = 0;
+    $('ytPipeGlobalPctText').textContent = '0%';
+    $('ytPipeGlobalBarFill').style.width = '0%';
+    $('ytPipeStageBadge').textContent = 'Avvio...';
+    $('ytPipeCounterText').textContent = 'Video 0 / 0';
+    $('ytPipeCurrentTitle').textContent = 'Inizializzazione...';
+    $('ytPipeCurrentStageBadge').textContent = '--';
+    $('ytPipeSpeedText').textContent = 'Velocità: --';
+    $('ytPipeEtaText').textContent = 'ETA: --';
+
+    fetch('/api/youtube/pipeline/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    }).then(r => r.json()).then(d => {
+      if (d.error) {
+        alert(d.error);
+        $('bYtPipeStart').disabled = false;
+        $('bYtPipeStop').disabled = true;
+        $('ytPipeStageBadge').textContent = 'Errore';
+        return;
+      }
+      if (ytPipePollTimer) clearInterval(ytPipePollTimer);
+      ytPipePollTimer = setInterval(pollYoutubePipelineStatus, 450);
+      pollYoutubePipelineStatus();
+    }).catch(err => {
+      alert('Errore nell\'avvio della pipeline: ' + err);
+      $('bYtPipeStart').disabled = false;
+      $('bYtPipeStop').disabled = true;
+    });
+  };
+}
+
+if ($('bYtPipeStop')) {
+  $('bYtPipeStop').onclick = () => {
+    if (!confirm('Vuoi interrompere la pipeline YouTube? L\'eventuale video in elaborazione verrà ripulito.')) return;
+    fetch('/api/youtube/pipeline/stop', {method: 'POST'}).catch(() => {});
+  };
+}
+
+function pollYoutubePipelineStatus() {
+  fetch('/api/youtube/pipeline/status?since=' + ytPipeSince).then(r => r.json()).then(d => {
+    ytPipeSince += (d.lines || []).length;
+    if (d.lines && d.lines.length) {
+      const logBox = $('ytPipeLog');
+      for (const line of d.lines) {
+        const row = document.createElement('div');
+        row.textContent = line;
+        if (line.includes('❌') || line.toLowerCase().includes('error')) {
+          row.style.color = 'var(--red)';
+        } else if (line.includes('🎉') || line.includes('✅')) {
+          row.style.color = '#4ade80';
+        } else if (line.includes('🚀') || line.includes('🎬') || line.includes('▶️')) {
+          row.style.color = '#60a5fa';
+        } else if (line.includes('⚠️')) {
+          row.style.color = '#fbbf24';
+        }
+        logBox.appendChild(row);
+      }
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    if (d.stage) {
+      $('ytPipeStageBadge').textContent = d.stage;
+    }
+    if (d.total_videos) {
+      $('ytPipeCounterText').textContent = `Video ${d.current_video_idx || 0} / ${d.total_videos}`;
+    }
+    if (d.current_video_title) {
+      $('ytPipeCurrentTitle').textContent = d.current_video_title;
+    }
+    if (d.current_stage) {
+      $('ytPipeCurrentStageBadge').textContent = d.current_stage;
+    }
+    if (d.speed) {
+      $('ytPipeSpeedText').textContent = 'Velocità: ' + d.speed;
+    }
+    if (d.eta) {
+      $('ytPipeEtaText').textContent = 'ETA: ' + d.eta;
+    }
+
+    const pctNum = Math.max(0, Math.min(100, Number(d.progress) || 0));
+    $('ytPipeGlobalPctText').textContent = (pctNum === 0 || pctNum === 100) ? Math.round(pctNum) + '%' : pctNum.toFixed(1) + '%';
+    $('ytPipeGlobalBarFill').style.width = pctNum + '%';
+
+    // Saved files list
+    if (d.saved_files && d.saved_files.length) {
+      $('ytPipeSavedWrap').style.display = 'block';
+      $('ytPipeSavedCount').textContent = d.saved_files.length;
+      const listEl = $('ytPipeSavedList');
+      listEl.innerHTML = '';
+      d.saved_files.forEach(f => {
+        const item = document.createElement('div');
+        item.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:3px 0; border-bottom:1px solid rgba(255,255,255,0.05); gap:8px';
+        const escapedPath = f.path.replace(/'/g, "\\'");
+        item.innerHTML = `
+          <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1" title="${escapeHtml(f.filename)}">
+            🎬 ${escapeHtml(f.filename)} (${f.size_mb} MB)
+          </span>
+          <button style="font-size:10px; padding:2px 6px; cursor:pointer" onclick="openInAutoCut('${escapedPath}')">Apri in AutoCut</button>
+        `;
+        listEl.appendChild(item);
+      });
+    }
+
+    if (!d.running) {
+      if (ytPipePollTimer) {
+        clearInterval(ytPipePollTimer);
+        ytPipePollTimer = null;
+      }
+      $('bYtPipeStart').disabled = false;
+      $('bYtPipeStop').disabled = true;
+
+      if (d.done) {
+        $('ytPipeStageBadge').textContent = 'Completata!';
+        $('ytPipeGlobalBarFill').style.width = '100%';
+        $('ytPipeGlobalPctText').textContent = '100%';
+        loadFiles();
+      } else if (d.cancelled) {
+        $('ytPipeStageBadge').textContent = 'Interrotta';
+      } else if (d.error) {
+        $('ytPipeStageBadge').textContent = 'Errore: ' + (d.error.length > 50 ? d.error.slice(0, 48) + '…' : d.error);
+      }
+    } else {
+      $('bYtPipeStart').disabled = true;
+      $('bYtPipeStop').disabled = false;
+    }
+  }).catch(() => {});
+}
+
+/* ---------- File Manager Client ---------- */
+let fmTreeData = null;
+let fmSelectedFolderKey = 'all';
+
+function loadFileManager() {
+  fetch('/api/files/tree').then(r => r.json()).then(data => {
+    fmTreeData = data;
+    renderFolderSidebar();
+    renderFileList();
+  }).catch(err => {
+    console.error('Errore caricamento file:', err);
+  });
+}
+
+function renderFolderSidebar() {
+  if (!fmTreeData) return;
+  const list = $('fmFolderList');
+  list.innerHTML = '';
+
+  // "Tutte le cartelle" button
+  const allBtn = document.createElement('div');
+  allBtn.className = 'fm-folder-btn' + (fmSelectedFolderKey === 'all' ? ' active' : '');
+  allBtn.innerHTML = `
+    <span>📁 Tutte le cartelle</span>
+    <span class="fm-badge">${fmTreeData.total_files} • ${fmTreeData.total_size_str}</span>
+  `;
+  allBtn.onclick = () => {
+    fmSelectedFolderKey = 'all';
+    renderFolderSidebar();
+    renderFileList();
+  };
+  list.appendChild(allBtn);
+
+  // Each folder
+  for (const f of fmTreeData.folders) {
+    const btn = document.createElement('div');
+    btn.className = 'fm-folder-btn' + (fmSelectedFolderKey === f.key ? ' active' : '');
+    btn.innerHTML = `
+      <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:180px">${f.label}</span>
+      <span class="fm-badge">${f.file_count} • ${f.size_str}</span>
+    `;
+    btn.onclick = () => {
+      fmSelectedFolderKey = f.key;
+      renderFolderSidebar();
+      renderFileList();
+    };
+    list.appendChild(btn);
+  }
+}
+
+function renderFileList() {
+  if (!fmTreeData) return;
+  const container = $('fmFilesContainer');
+  container.innerHTML = '';
+
+  const search = ($('fmSearchInput').value || '').trim().toLowerCase();
+  const typeFilter = $('fmTypeFilter').value;
+
+  // Filter files
+  let currentFolder = null;
+  let filesToShow = [];
+
+  if (fmSelectedFolderKey === 'all') {
+    $('fmCurrentFolderTitle').textContent = 'Tutte le cartelle del progetto';
+    for (const f of fmTreeData.folders) {
+      filesToShow = filesToShow.concat(f.files);
+    }
+  } else {
+    currentFolder = fmTreeData.folders.find(f => f.key === fmSelectedFolderKey);
+    if (currentFolder) {
+      $('fmCurrentFolderTitle').textContent = currentFolder.label;
+      filesToShow = currentFolder.files;
+    }
+  }
+
+  // Filter by search and type
+  const filtered = filesToShow.filter(item => {
+    if (typeFilter !== 'all' && item.type !== typeFilter) return false;
+    if (search && !item.name.toLowerCase().includes(search)) return false;
+    return true;
+  });
+
+  const totalBytes = filtered.reduce((acc, cur) => acc + (cur.size || 0), 0);
+  const sizeFormatted = (totalBytes < 1024*1024) ? (totalBytes/1024).toFixed(1) + ' KB' : (totalBytes < 1024*1024*1024 ? (totalBytes/(1024*1024)).toFixed(1) + ' MB' : (totalBytes/(1024*1024*1024)).toFixed(2) + ' GB');
+  $('fmFolderStatsBadge').textContent = `${filtered.length} file • ${sizeFormatted}`;
+
+  if (!filtered.length) {
+    container.innerHTML = `
+      <div style="text-align:center; padding:40px 20px; color:var(--muted)">
+        <div style="font-size:32px; margin-bottom:8px">📭</div>
+        <div>Nessun file trovato in questa cartella o con i filtri correnti.</div>
+      </div>
+    `;
+    return;
+  }
+
+  for (const file of filtered) {
+    const card = document.createElement('div');
+    card.className = 'fm-file-card';
+
+    // Left info
+    const left = document.createElement('div');
+    left.style.cssText = 'min-width:0; flex:1; display:flex; align-items:flex-start; gap:10px';
+
+    const icon = document.createElement('span');
+    icon.style.cssText = 'font-size:20px; flex-shrink:0; line-height:1.2';
+    icon.textContent = file.icon;
+    left.appendChild(icon);
+
+    const infoBox = document.createElement('div');
+    infoBox.style.cssText = 'min-width:0; flex:1';
+
+    const title = document.createElement('div');
+    title.className = 'fm-file-title';
+    title.textContent = file.name;
+    infoBox.appendChild(title);
+
+    const sub = document.createElement('div');
+    sub.className = 'fm-file-sub';
+    sub.innerHTML = `
+      <span>📦 <b>${file.size_str}</b></span>
+      <span>📅 ${file.mtime_str}</span>
+      <span>📁 <code style="color:#38bdf8">${file.folder === '.' ? 'root' : file.folder}</code></span>
+    `;
+    infoBox.appendChild(sub);
+    left.appendChild(infoBox);
+    card.appendChild(left);
+
+    // Actions
+    const acts = document.createElement('div');
+    acts.className = 'fm-actions';
+
+    // If media, allow open in AutoCut & Preview
+    if (file.is_media) {
+      const bCut = document.createElement('button');
+      bCut.className = 'btn-fm btn-fm-autocut';
+      bCut.innerHTML = '🎬 AutoCut';
+      bCut.title = 'Apri come sorgente in AutoCut';
+      bCut.onclick = () => openInAutoCut(file.path);
+      acts.appendChild(bCut);
+
+      const bPlay = document.createElement('button');
+      bPlay.className = 'btn-fm';
+      bPlay.innerHTML = '▶️ Anteprima';
+      bPlay.title = 'Riproduci nel browser';
+      bPlay.onclick = () => openMediaModal(file);
+      acts.appendChild(bPlay);
+    }
+
+    // Reveal in Finder
+    const bFind = document.createElement('button');
+    bFind.className = 'btn-fm';
+    bFind.innerHTML = '📂 Finder';
+    bFind.title = 'Mostra nel Finder di macOS';
+    bFind.onclick = () => {
+      fetch('/api/files/open', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({path: file.path})
+      });
+    };
+    acts.appendChild(bFind);
+
+    // Download button
+    const bDl = document.createElement('a');
+    bDl.className = 'btn-fm';
+    bDl.innerHTML = '⬇️';
+    bDl.title = 'Scarica file';
+    bDl.href = '/file?path=' + encodeURIComponent(file.path);
+    bDl.download = file.name;
+    acts.appendChild(bDl);
+
+    // Rename & delete (if not protected)
+    if (!file.is_protected) {
+      const bRen = document.createElement('button');
+      bRen.className = 'btn-fm';
+      bRen.innerHTML = '✏️';
+      bRen.title = 'Rinomina file';
+      bRen.onclick = () => promptRename(file);
+      acts.appendChild(bRen);
+
+      const bDel = document.createElement('button');
+      bDel.className = 'btn-fm btn-fm-danger';
+      bDel.innerHTML = '🗑️';
+      bDel.title = 'Elimina file definitivamente';
+      bDel.onclick = () => confirmDelete(file);
+      acts.appendChild(bDel);
+    }
+
+    card.appendChild(acts);
+    container.appendChild(card);
+  }
+}
+
+function promptRename(file) {
+  const newName = prompt('Inserisci il nuovo nome per:\n' + file.name, file.name);
+  if (!newName || newName.trim() === file.name) return;
+  fetch('/api/files/rename', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: file.path, new_name: newName.trim()})
+  }).then(r => r.json()).then(res => {
+    if (res.error) alert('Errore: ' + res.error);
+    else {
+      loadFileManager();
+      loadFiles();
+    }
+  }).catch(err => alert('Errore: ' + err));
+}
+
+function confirmDelete(file) {
+  if (!confirm(`Sei sicuro di voler eliminare definitivamente:\n\n"${file.name}" (${file.size_str})?\n\nQuesta azione non può essere annullata.`)) {
+    return;
+  }
+  fetch('/api/files/delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: file.path})
+  }).then(r => r.json()).then(res => {
+    if (res.error) alert('Errore: ' + res.error);
+    else {
+      loadFileManager();
+      loadFiles();
+    }
+  }).catch(err => alert('Errore: ' + err));
+}
+
+function openMediaModal(file) {
+  const modal = $('fmMediaModal');
+  const vPlayer = $('fmModalVideo');
+  const aPlayer = $('fmModalAudio');
+  $('fmModalTitle').textContent = file.name;
+  $('fmModalIcon').textContent = file.icon;
+  $('fmModalMeta').textContent = `${file.size_str} • ${file.folder} • Modificato: ${file.mtime_str}`;
+  $('bFmModalDownload').onclick = () => {
+    window.open('/file?path=' + encodeURIComponent(file.path), '_blank');
+  };
+  $('bFmModalOpenAutoCut').onclick = () => {
+    closeMediaModal();
+    openInAutoCut(file.path);
+  };
+
+  const fileUrl = '/file?path=' + encodeURIComponent(file.path);
+
+  if (file.type === 'video') {
+    aPlayer.pause();
+    aPlayer.style.display = 'none';
+    vPlayer.src = fileUrl;
+    vPlayer.style.display = 'block';
+    vPlayer.play().catch(() => {});
+  } else {
+    vPlayer.pause();
+    vPlayer.style.display = 'none';
+    aPlayer.src = fileUrl;
+    aPlayer.style.display = 'block';
+    aPlayer.play().catch(() => {});
+  }
+
+  modal.classList.add('active');
+}
+
+function closeMediaModal() {
+  const modal = $('fmMediaModal');
+  $('fmModalVideo').pause();
+  $('fmModalVideo').src = '';
+  $('fmModalAudio').pause();
+  $('fmModalAudio').src = '';
+  modal.classList.remove('active');
+}
+
+$('bFmCloseModal').onclick = closeMediaModal;
+$('fmMediaModal').onclick = (e) => {
+  if (e.target === $('fmMediaModal')) closeMediaModal();
+};
+
+$('bFmReload').onclick = loadFileManager;
+$('fmSearchInput').addEventListener('input', renderFileList);
+$('fmTypeFilter').addEventListener('change', renderFileList);
+$('bFmOpenProjectFinder').onclick = () => {
+  fetch('/api/files/open', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: fmTreeData ? fmTreeData.root_path : '.'})
+  });
+};
+
 loadFiles();
+checkTwitchSystem();
+checkYoutubeSystem();
 </script>
 <script src="/wave.js"></script>
 </body>
@@ -1730,6 +3938,45 @@ class UIHandler(BaseHTTPRequestHandler):
                 return
             self._serve_file(target)
 
+        elif path == "/api/twitch/status":
+            since = int(_query(self, "since") or 0)
+            _send_json(self, TWITCH_JOB.get_status(since))
+
+        elif path == "/api/twitch/check":
+            cli = find_twitch_cli()
+            ff = find_ffmpeg()
+            _send_json(self, {
+                "cli": cli is not None,
+                "cli_path": str(cli) if cli else None,
+                "ffmpeg": ff is not None,
+                "ffmpeg_path": ff,
+            })
+
+        elif path == "/api/twitch/oauth":
+            _send_json(self, {"oauth": load_saved_oauth()})
+
+        elif path == "/api/youtube/status":
+            since = int(_query(self, "since") or 0)
+            _send_json(self, YOUTUBE_JOB.get_status(since))
+
+        elif path == "/api/youtube/pipeline/status":
+            since = int(_query(self, "since") or 0)
+            _send_json(self, YOUTUBE_PIPELINE_JOB.get_status(since))
+
+        elif path == "/api/youtube/models":
+            _send_json(self, get_available_models())
+
+        elif path == "/api/youtube/check":
+            ff = ensure_ffmpeg_in_path()
+            _send_json(self, {
+                "ytdlp": True,
+                "ffmpeg": ff is not None,
+                "ffmpeg_path": ff,
+            })
+
+        elif path == "/api/files/tree":
+            _send_json(self, get_project_tree())
+
         else:
             self.send_error(404)
 
@@ -1781,6 +4028,88 @@ class UIHandler(BaseHTTPRequestHandler):
         elif path == "/api/stop":
             stop_run()
             _send_json(self, {"ok": True})
+
+        elif path == "/api/twitch/download":
+            ok, msg = TWITCH_JOB.start(data)
+            if not ok:
+                _send_json(self, {"error": msg}, 400)
+            else:
+                _send_json(self, {"ok": True, "message": msg})
+
+        elif path == "/api/twitch/stop":
+            stopped = TWITCH_JOB.stop()
+            _send_json(self, {"ok": stopped})
+
+        elif path == "/api/twitch/oauth":
+            tok = str(data.get("oauth", "")).strip()
+            save_oauth_token(tok)
+            _send_json(self, {"ok": True, "saved": bool(tok)})
+
+        elif path == "/api/youtube/info":
+            u = str(data.get("url", "")).strip()
+            if not u:
+                _send_json(self, {"error": "Inserisci un link YouTube valido."}, 400)
+                return
+            try:
+                info = fetch_video_info(u)
+                _send_json(self, info)
+            except Exception as exc:
+                _send_json(self, {"error": str(exc)}, 400)
+
+        elif path == "/api/youtube/playlist/info":
+            u = str(data.get("url", "")).strip()
+            if not u:
+                _send_json(self, {"error": "Inserisci un link playlist valido."}, 400)
+                return
+            try:
+                info = fetch_playlist_info(u)
+                _send_json(self, info)
+            except Exception as exc:
+                _send_json(self, {"error": str(exc)}, 400)
+
+        elif path == "/api/youtube/download":
+            ok, msg = YOUTUBE_JOB.start(data)
+            if not ok:
+                _send_json(self, {"error": msg}, 400)
+            else:
+                _send_json(self, {"ok": True, "message": msg})
+
+        elif path == "/api/youtube/stop":
+            stopped = YOUTUBE_JOB.stop()
+            _send_json(self, {"ok": stopped})
+
+        elif path == "/api/youtube/pipeline/start":
+            ok, msg = YOUTUBE_PIPELINE_JOB.start(data)
+            if not ok:
+                _send_json(self, {"error": msg}, 400)
+            else:
+                _send_json(self, {"ok": True, "message": msg})
+
+        elif path == "/api/youtube/pipeline/stop":
+            stopped = YOUTUBE_PIPELINE_JOB.stop()
+            _send_json(self, {"ok": stopped})
+
+        elif path == "/api/files/open":
+            p = str(data.get("path", "")).strip()
+            ok = reveal_in_os(p)
+            _send_json(self, {"ok": ok})
+
+        elif path == "/api/files/delete":
+            p = str(data.get("path", "")).strip()
+            ok, msg = delete_project_file(p)
+            if not ok:
+                _send_json(self, {"error": msg}, 400)
+            else:
+                _send_json(self, {"ok": True, "message": msg})
+
+        elif path == "/api/files/rename":
+            p = str(data.get("path", "")).strip()
+            new_name = str(data.get("new_name", "")).strip()
+            ok, msg, target = rename_project_file(p, new_name)
+            if not ok:
+                _send_json(self, {"error": msg}, 400)
+            else:
+                _send_json(self, {"ok": True, "message": msg, "path": target})
 
         else:
             self.send_error(404)

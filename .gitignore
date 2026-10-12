@@ -52,6 +52,7 @@ Thumbs.db
 
 # Tools cache
 .freebuff/
+bin/
 
 # ==============================================================================
 # Large Media Files (Video & Audio)
@@ -102,3 +103,5 @@ test_etichette.txt
 *_etichette.txt
 temp/
 tmp/
+.twitch_oauth*
+*.oauth
